@@ -277,7 +277,11 @@ export function handleReflect() {
   // Get content from FTS (must use raw SQL)
   const content = sqlite.prepare(`
     SELECT content FROM oracle_fts WHERE id = ?
-  `).get(randomDoc.id) as { content: string };
+  `).get(randomDoc.id) as { content: string } | undefined;
+
+  if (!content) {
+    return { error: 'Document content not found in FTS index' };
+  }
 
   return {
     id: randomDoc.id,

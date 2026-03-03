@@ -152,8 +152,6 @@ export async function vectorSearch(
   } catch (error) {
     const errorMsg = error instanceof Error ? error.stack || error.message : String(error);
     console.error('[ChromaDB ERROR]', errorMsg);
-    const fs = await import('fs');
-    fs.appendFileSync('/tmp/oracle-chroma-debug.log', `[${new Date().toISOString()}] ${errorMsg}\n`);
     return [];
   }
 }

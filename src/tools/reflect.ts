@@ -36,7 +36,11 @@ export async function handleReflect(ctx: ToolContext, _input: OracleReflectInput
 
   const content = ctx.sqlite.prepare(`
     SELECT content FROM oracle_fts WHERE id = ?
-  `).get(randomDoc.id) as { content: string };
+  `).get(randomDoc.id) as { content: string } | undefined;
+
+  if (!content) {
+    throw new Error('Document content not found in FTS index');
+  }
 
   return {
     content: [{

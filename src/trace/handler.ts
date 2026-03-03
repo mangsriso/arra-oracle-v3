@@ -10,9 +10,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { eq, desc, and, like, sql, isNull } from 'drizzle-orm';
 import { db, traceLog } from '../db/index.ts';
-
-// Get repo root for ψ directory
-const REPO_ROOT = process.env.REPO_ROOT || process.cwd();
+import { REPO_ROOT } from '../config.ts';
 import type {
   CreateTraceInput,
   CreateTraceResult,

@@ -28,8 +28,10 @@ function safeJsonParse(text: string): any {
     fixed = fixed.replace(/\.\.\.,\s*/g, '');
 
     // Python → JSON conversions
+    // Only replace single quotes used as JSON structural delimiters, not apostrophes in content
     fixed = fixed
-      .replace(/'/g, '"')
+      .replace(/(\{|\[|,\s*)'/g, '$1"')
+      .replace(/'(\s*[:,\}\]])/g, '"$1')
       .replace(/\bNone\b/g, 'null')
       .replace(/\bTrue\b/g, 'true')
       .replace(/\bFalse\b/g, 'false');

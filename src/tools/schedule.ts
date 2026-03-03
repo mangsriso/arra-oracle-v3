@@ -197,7 +197,7 @@ export async function handleScheduleAdd(ctx: ToolContext, input: OracleScheduleA
     time: time || null,
     event,
     notes: notes || null,
-    recurring: (input as any).recurring || null,
+    recurring: input.recurring || null,
     status: 'pending',
     createdAt: now,
     updatedAt: now,
@@ -224,8 +224,8 @@ export async function handleScheduleAdd(ctx: ToolContext, input: OracleScheduleA
 }
 
 export async function handleScheduleList(ctx: ToolContext, input: OracleScheduleListInput): Promise<ToolResponse> {
-  const limit = (input as any).limit || 50;
-  const statusFilter = (input as any).status || 'pending';
+  const limit = input.limit || 50;
+  const statusFilter = input.status || 'pending';
 
   // Build where conditions
   const conditions = [];
@@ -234,14 +234,14 @@ export async function handleScheduleList(ctx: ToolContext, input: OracleSchedule
     conditions.push(eq(schedule.status, statusFilter));
   }
 
-  if ((input as any).date) {
+  if (input.date) {
     // Single day query
-    const day = parseDate((input as any).date);
+    const day = parseDate(input.date);
     conditions.push(eq(schedule.date, day));
   } else {
     // Range query
-    const from = (input as any).from ? parseDate((input as any).from) : fmt(new Date());
-    const to = (input as any).to ? parseDate((input as any).to) : (() => {
+    const from = input.from ? parseDate(input.from) : fmt(new Date());
+    const to = input.to ? parseDate(input.to) : (() => {
       const d = new Date();
       d.setDate(d.getDate() + 14);
       return fmt(d);

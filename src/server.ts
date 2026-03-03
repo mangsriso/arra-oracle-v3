@@ -66,6 +66,8 @@ import {
 } from './server/dashboard.ts';
 
 import { handleContext } from './server/context.ts';
+import { handleScheduleAdd, handleScheduleList } from './tools/schedule.ts';
+import type { ToolContext } from './tools/types.ts';
 
 import {
   handleThreadMessage,
@@ -635,14 +637,13 @@ app.get('/api/schedule/md', (c) => {
 });
 
 app.get('/api/schedule', async (c) => {
-  const { handleScheduleList } = await import('./tools/schedule.ts');
-  const ctx = { db, sqlite, repoRoot: REPO_ROOT } as any;
-  const result = await handleScheduleList(ctx, {
+  const ctx = { db, sqlite, repoRoot: REPO_ROOT } as Pick<ToolContext, 'db' | 'sqlite' | 'repoRoot'>;
+  const result = await handleScheduleList(ctx as ToolContext, {
     date: c.req.query('date'),
     from: c.req.query('from'),
     to: c.req.query('to'),
     filter: c.req.query('filter'),
-    status: c.req.query('status') as any,
+    status: c.req.query('status') as 'pending' | 'done' | 'cancelled' | 'all' | undefined,
     limit: c.req.query('limit') ? parseInt(c.req.query('limit')!) : undefined,
   });
   const text = result.content[0]?.text || '{}';
@@ -650,13 +651,11 @@ app.get('/api/schedule', async (c) => {
 });
 
 app.post('/api/schedule', async (c) => {
-  const { handleScheduleAdd } = await import('./tools/schedule.ts');
   const body = await c.req.json();
-  const ctx = { db, sqlite, repoRoot: REPO_ROOT } as any;
-  const result = await handleScheduleAdd(ctx, body);
+  const ctx = { db, sqlite, repoRoot: REPO_ROOT } as Pick<ToolContext, 'db' | 'sqlite' | 'repoRoot'>;
+  const result = await handleScheduleAdd(ctx as ToolContext, body);
   const text = result.content[0]?.text || '{}';
   return c.json(JSON.parse(text));
-
 });
 
 // Update schedule event status
