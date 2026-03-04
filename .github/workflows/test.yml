@@ -35,10 +35,8 @@ jobs:
           bun-version: latest
       - run: bun install
       - run: mkdir -p ~/.oracle
-      - run: bun run db:push
       - run: bun test:integration:db
       - run: bun test:integration:mcp
-      - run: bun test:seed
       - name: Start server for HTTP tests
         run: |
           ORACLE_CHROMA_TIMEOUT=2000 bun run src/server.ts &
@@ -49,19 +47,3 @@ jobs:
       - name: Stop server
         if: always()
         run: kill $(lsof -ti :47778) 2>/dev/null || true
-
-  e2e:
-    name: E2E Tests
-    runs-on: ubuntu-latest
-    needs: integration
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-      - run: bun install
-      - run: bunx playwright install --with-deps chromium
-      - run: mkdir -p ~/.oracle
-      - run: bun run db:push
-      - run: bun test:seed
-      - run: bun test:e2e

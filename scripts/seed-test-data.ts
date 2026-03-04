@@ -1,40 +1,26 @@
 #!/usr/bin/env bun
 /**
  * Seed minimal test data for integration tests
+ *
+ * Uses createDatabase() to ensure schema (migrations + FTS5)
+ * is initialized before seeding.
  */
-import Database from "bun:sqlite";
-import path from "path";
+import { createDatabase } from "../src/db/index.ts";
 
-const ORACLE_DATA_DIR = process.env.ORACLE_DATA_DIR ||
-  path.join(process.env.HOME || '/tmp', '.oracle');
-const DB_PATH = process.env.ORACLE_DB_PATH || path.join(ORACLE_DATA_DIR, 'oracle.db');
+const { sqlite } = createDatabase();
 
-console.log(`Seeding test data to: ${DB_PATH}`);
-
-const db = new Database(DB_PATH);
-
-// Create FTS5 table if not exists (not managed by drizzle)
-db.exec(`
-  CREATE VIRTUAL TABLE IF NOT EXISTS oracle_fts USING fts5(
-    id,
-    type,
-    title,
-    content,
-    concepts,
-    tokenize = 'porter unicode61'
-  );
-`);
+console.log(`Seeding test data to: ${sqlite.filename}`);
 
 const now = Date.now();
 
 // Insert test documents into main table
-const insertDoc = db.prepare(`
+const insertDoc = sqlite.prepare(`
   INSERT OR IGNORE INTO oracle_documents (id, type, source_file, concepts, created_at, updated_at, indexed_at)
   VALUES (?, ?, ?, ?, ?, ?, ?)
 `);
 
 // Insert into FTS5 table for content search
-const insertFts = db.prepare(`
+const insertFts = sqlite.prepare(`
   INSERT OR IGNORE INTO oracle_fts (id, type, title, content, concepts)
   VALUES (?, ?, ?, ?, ?)
 `);
@@ -67,25 +53,9 @@ const testDocs = [
 ];
 
 for (const doc of testDocs) {
-  // Main table
-  insertDoc.run(
-    doc.id,
-    doc.type,
-    doc.source_file,
-    doc.concepts,
-    now,
-    now,
-    now
-  );
-  // FTS5 table
-  insertFts.run(
-    doc.id,
-    doc.type,
-    doc.title,
-    doc.content,
-    doc.concepts
-  );
+  insertDoc.run(doc.id, doc.type, doc.source_file, doc.concepts, now, now, now);
+  insertFts.run(doc.id, doc.type, doc.title, doc.content, doc.concepts);
 }
 
 console.log(`✅ Seeded ${testDocs.length} test documents`);
-db.close();
+sqlite.close();
