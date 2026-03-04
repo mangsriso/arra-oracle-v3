@@ -49,7 +49,16 @@ describe("HTTP API Integration", () => {
 
     const ready = await waitForServer();
     if (!ready) {
-      throw new Error("Server failed to start within 15 seconds");
+      // Capture server stderr for debugging
+      let stderr = '';
+      if (serverProcess.stderr) {
+        const reader = serverProcess.stderr.getReader();
+        try {
+          const { value } = await reader.read();
+          if (value) stderr = new TextDecoder().decode(value);
+        } catch { /* ignore */ }
+      }
+      throw new Error(`Server failed to start within 15 seconds.\nServer stderr: ${stderr}`);
     }
     console.log("Server ready");
   }, 30_000);
