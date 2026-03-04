@@ -6,8 +6,7 @@
   "main": "src/index.ts",
   "bin": {
     "oracle-v2": "./src/index.ts",
-    "oracle-vault": "./src/vault/cli.ts",
-    "oracle": "./src/cli/index.ts"
+    "oracle-cli": "./src/cli/index.ts"
   },
   "files": [
     "src",
