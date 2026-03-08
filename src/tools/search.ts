@@ -67,7 +67,9 @@ export const searchToolDef = {
 
 /**
  * Sanitize FTS5 query to prevent parse errors.
- * Removes FTS5 special characters that cause syntax errors.
+ * Removes FTS5 operators, column-prefix syntax, and characters that cause
+ * FTS5 syntax errors (dots, slashes — treated as separators by tokenizer
+ * but rejected by query parser).
  */
 export function sanitizeFtsQuery(query: string): string {
   let sanitized = query
@@ -333,26 +335,32 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
   // Run FTS5 search (skip if vector-only mode)
   let ftsRawResults: any[] = [];
   if (mode !== 'vector') {
-    if (type === 'all') {
-      const stmt = ctx.sqlite.prepare(`
-        SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? ${projectFilter}
-        ORDER BY rank
-        LIMIT ?
-      `);
-      ftsRawResults = stmt.all(safeQuery, ...projectParams, limit * 2);
-    } else {
-      const stmt = ctx.sqlite.prepare(`
-        SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND d.type = ? ${projectFilter}
-        ORDER BY rank
-        LIMIT ?
-      `);
-      ftsRawResults = stmt.all(safeQuery, type, ...projectParams, limit * 2);
+    try {
+      if (type === 'all') {
+        const stmt = ctx.sqlite.prepare(`
+          SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? ${projectFilter}
+          ORDER BY rank
+          LIMIT ?
+        `);
+        ftsRawResults = stmt.all(safeQuery, ...projectParams, limit * 2);
+      } else {
+        const stmt = ctx.sqlite.prepare(`
+          SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND d.type = ? ${projectFilter}
+          ORDER BY rank
+          LIMIT ?
+        `);
+        ftsRawResults = stmt.all(safeQuery, type, ...projectParams, limit * 2);
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error('[FTS5] Query error:', msg, '| query:', safeQuery);
+      warning = `FTS5 search error: ${msg}. Using vector results only.`;
     }
   }
 

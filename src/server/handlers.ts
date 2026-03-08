@@ -16,6 +16,7 @@ import { getVectorStoreByModel, ensureVectorStoreConnected, getEmbeddingModels, 
 import type { VectorStoreAdapter } from '../vector/types.ts';
 import { detectProject } from './project-detect.ts';
 import { coerceConcepts } from '../tools/learn.ts';
+import { sanitizeFtsQuery } from '../tools/search.ts';
 
 // Use shared model-based vector store registry
 async function getVectorStore(model?: string): Promise<VectorStoreAdapter> {
@@ -39,8 +40,7 @@ export async function handleSearch(
   // Auto-detect project from cwd if not explicitly specified
   const resolvedProject = (project ?? detectProject(cwd))?.toLowerCase() ?? null;
   const startTime = Date.now();
-  // Remove FTS5 special characters: ? * + - ( ) ^ ~ " ' : (colon is column prefix)
-  const safeQuery = query.replace(/[?*+\-()^~"':]/g, ' ').replace(/\s+/g, ' ').trim();
+  const safeQuery = sanitizeFtsQuery(query);
 
   let warning: string | undefined;
 
@@ -57,60 +57,66 @@ export async function handleSearch(
 
   // FTS5 search must use raw SQL (Drizzle doesn't support virtual tables)
   if (mode !== 'vector') {
-    if (type === 'all') {
-      const countStmt = sqlite.prepare(`
-        SELECT COUNT(*) as total
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND ${projectFilter}
-      `);
-      ftsTotal = (countStmt.get(safeQuery, ...projectParams) as { total: number }).total;
+    try {
+      if (type === 'all') {
+        const countStmt = sqlite.prepare(`
+          SELECT COUNT(*) as total
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND ${projectFilter}
+        `);
+        ftsTotal = (countStmt.get(safeQuery, ...projectParams) as { total: number }).total;
 
-      const stmt = sqlite.prepare(`
-        SELECT f.id, f.content, d.type, d.source_file, d.concepts, d.project, rank as score
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND ${projectFilter}
-        ORDER BY rank
-        LIMIT ?
-      `);
-      ftsResults = stmt.all(safeQuery, ...projectParams, limit * 2).map((row: any) => ({
-        id: row.id,
-        type: row.type,
-        content: row.content,
-        source_file: row.source_file,
-        concepts: JSON.parse(row.concepts || '[]'),
-        project: row.project,
-        source: 'fts' as const,
-        score: normalizeRank(row.score)
-      }));
-    } else {
-      const countStmt = sqlite.prepare(`
-        SELECT COUNT(*) as total
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND d.type = ? AND ${projectFilter}
-      `);
-      ftsTotal = (countStmt.get(safeQuery, type, ...projectParams) as { total: number }).total;
+        const stmt = sqlite.prepare(`
+          SELECT f.id, f.content, d.type, d.source_file, d.concepts, d.project, rank as score
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND ${projectFilter}
+          ORDER BY rank
+          LIMIT ?
+        `);
+        ftsResults = stmt.all(safeQuery, ...projectParams, limit * 2).map((row: any) => ({
+          id: row.id,
+          type: row.type,
+          content: row.content,
+          source_file: row.source_file,
+          concepts: JSON.parse(row.concepts || '[]'),
+          project: row.project,
+          source: 'fts' as const,
+          score: normalizeRank(row.score)
+        }));
+      } else {
+        const countStmt = sqlite.prepare(`
+          SELECT COUNT(*) as total
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND d.type = ? AND ${projectFilter}
+        `);
+        ftsTotal = (countStmt.get(safeQuery, type, ...projectParams) as { total: number }).total;
 
-      const stmt = sqlite.prepare(`
-        SELECT f.id, f.content, d.type, d.source_file, d.concepts, d.project, rank as score
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND d.type = ? AND ${projectFilter}
-        ORDER BY rank
-        LIMIT ?
-      `);
-      ftsResults = stmt.all(safeQuery, type, ...projectParams, limit * 2).map((row: any) => ({
-        id: row.id,
-        type: row.type,
-        content: row.content,
-        source_file: row.source_file,
-        concepts: JSON.parse(row.concepts || '[]'),
-        project: row.project,
-        source: 'fts' as const,
-        score: normalizeRank(row.score)
-      }));
+        const stmt = sqlite.prepare(`
+          SELECT f.id, f.content, d.type, d.source_file, d.concepts, d.project, rank as score
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND d.type = ? AND ${projectFilter}
+          ORDER BY rank
+          LIMIT ?
+        `);
+        ftsResults = stmt.all(safeQuery, type, ...projectParams, limit * 2).map((row: any) => ({
+          id: row.id,
+          type: row.type,
+          content: row.content,
+          source_file: row.source_file,
+          concepts: JSON.parse(row.concepts || '[]'),
+          project: row.project,
+          source: 'fts' as const,
+          score: normalizeRank(row.score)
+        }));
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error('[FTS5] Query error:', msg, '| query:', safeQuery);
+      warning = `FTS5 search error: ${msg}. Using vector results only.`;
     }
   }
 

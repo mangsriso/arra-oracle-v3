@@ -52,6 +52,13 @@ describe('sanitizeFtsQuery', () => {
     expect(sanitizeFtsQuery('Shopee/Lazada/TikTok')).toBe('Shopee Lazada TikTok');
     expect(sanitizeFtsQuery('path/to/file')).toBe('path to file');
   });
+
+  it('should handle dots which break FTS5 query parser', () => {
+    expect(sanitizeFtsQuery('v2.0.10')).toBe('v2 0 10');
+    expect(sanitizeFtsQuery('oracle-v2.0.10')).toBe('oracle v2 0 10');
+    expect(sanitizeFtsQuery('192.168.1.1')).toBe('192 168 1 1');
+    expect(sanitizeFtsQuery('config.yaml')).toBe('config yaml');
+  });
 });
 
 // ============================================================================
