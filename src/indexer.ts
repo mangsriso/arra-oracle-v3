@@ -778,7 +778,8 @@ export class OracleIndexer {
           })
           .run();
 
-        // SQLite FTS (raw SQL required for FTS5)
+        // SQLite FTS (raw SQL required for FTS5) — delete before insert to prevent bloat on re-index
+        this.sqlite.prepare('DELETE FROM oracle_fts WHERE id = ?').run(doc.id);
         insertFts.run(
           doc.id,
           doc.content,
