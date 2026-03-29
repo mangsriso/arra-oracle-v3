@@ -791,7 +791,8 @@ export class OracleIndexer {
         metadatas.push({
           type: doc.type,
           source_file: doc.source_file,
-          concepts: doc.concepts.join(',')  // Convert array to string for ChromaDB
+          concepts: doc.concepts.join(','),  // Convert array to string for ChromaDB
+          project: docProject ?? ''  // Empty string = universal (ChromaDB requires non-null)
         });
       }
       this.sqlite.exec('COMMIT');

@@ -385,9 +385,10 @@ app.get('/api/search', async (c) => {
   const project = c.req.query('project'); // Explicit project filter
   const cwd = c.req.query('cwd');         // Auto-detect project from cwd
   const model = c.req.query('model');     // Embedding model: 'bge-m3' (default), 'nomic', or 'qwen3'
+  const all_projects = c.req.query('all_projects') === 'true';  // Cross-oracle search
 
   try {
-    const result = await handleSearch(q, type, limit, offset, mode, project, cwd, model);
+    const result = await handleSearch(q, type, limit, offset, mode, project, cwd, model, all_projects);
     return c.json({ ...result, query: q });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);

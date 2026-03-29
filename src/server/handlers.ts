@@ -35,10 +35,14 @@ export async function handleSearch(
   mode: 'hybrid' | 'fts' | 'vector' = 'hybrid',
   project?: string,  // If set: project + universal. If null/undefined: universal only
   cwd?: string,      // Auto-detect project from cwd if project not specified
-  model?: string     // Embedding model: 'bge-m3' (default, multilingual) or 'nomic' (fast)
+  model?: string,    // Embedding model: 'bge-m3' (default, multilingual) or 'nomic' (fast)
+  all_projects?: boolean  // If true: bypass project scope for cross-oracle search
 ): Promise<SearchResponse & { mode?: string; warning?: string; model?: string }> {
   // Auto-detect project from cwd if not explicitly specified
-  const resolvedProject = (project ?? detectProject(cwd))?.toLowerCase() ?? null;
+  // all_projects bypasses project scoping for cross-oracle search
+  const resolvedProject = all_projects
+    ? null
+    : (project ?? detectProject(cwd))?.toLowerCase() ?? null;
   const startTime = Date.now();
   const safeQuery = sanitizeFtsQuery(query);
 

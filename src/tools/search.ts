@@ -55,6 +55,11 @@ export const searchToolDef = {
         type: 'string',
         enum: ['nomic', 'qwen3', 'bge-m3'],
         description: 'Embedding model: bge-m3 (default, multilingual Thai↔EN, 1024-dim), nomic (fast, 768-dim), or qwen3 (cross-language, 4096-dim)',
+      },
+      all_projects: {
+        type: 'boolean',
+        description: 'Search across all oracle projects (bypass project scope). Use for cross-oracle knowledge retrieval.',
+        default: false
       }
     },
     required: ['query']
@@ -311,7 +316,7 @@ export function combineResults(
 
 export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): Promise<ToolResponse> {
   const startTime = Date.now();
-  const { query, type = 'all', limit = 5, offset = 0, mode = 'hybrid', project, cwd, model } = input;
+  const { query, type = 'all', limit = 5, offset = 0, mode = 'hybrid', project, cwd, model, all_projects } = input;
 
   if (!query || query.trim().length === 0) {
     throw new Error('Query cannot be empty');
@@ -320,7 +325,10 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
   const safeQuery = sanitizeFtsQuery(query);
 
   // Auto-detect project from cwd if not explicitly specified
-  const resolvedProject = (project ?? detectProject(cwd))?.toLowerCase() ?? null;
+  // all_projects bypasses project scoping for cross-oracle search
+  const resolvedProject = all_projects
+    ? null
+    : (project ?? detectProject(cwd))?.toLowerCase() ?? null;
 
   // Project filter: if project specified, include project + universal (NULL)
   // If no project, return ALL documents (no filter)
