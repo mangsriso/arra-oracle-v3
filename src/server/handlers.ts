@@ -9,7 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { eq, sql, or, inArray } from 'drizzle-orm';
 import { db, sqlite, oracleDocuments, indexingStatus } from '../db/index.ts';
-import { REPO_ROOT } from '../config.ts';
+import { REPO_ROOT, ORACLE_SEARCH_SCOPE } from '../config.ts';
 import { logSearch, logDocumentAccess, logLearning } from './logging.ts';
 import type { SearchResult, SearchResponse } from './types.ts';
 import { getVectorStoreByModel, ensureVectorStoreConnected, getEmbeddingModels, EMBEDDING_MODELS } from '../vector/factory.ts';
@@ -38,10 +38,12 @@ export async function handleSearch(
   model?: string,    // Embedding model: 'bge-m3' (default, multilingual) or 'nomic' (fast)
   all_projects?: boolean  // If true: bypass project scope for cross-oracle search
 ): Promise<SearchResponse & { mode?: string; warning?: string; model?: string }> {
-  // Auto-detect project from cwd if not explicitly specified
-  // all_projects bypasses project scoping for cross-oracle search
-  const resolvedProject = all_projects
-    ? null
+  // Auto-detect project from cwd if not explicitly specified.
+  // ORACLE_SEARCH_SCOPE=all or all_projects bypasses cwd auto-detection,
+  // but an explicit `project` param still scopes the search.
+  const scopeAll = ORACLE_SEARCH_SCOPE === 'all' || all_projects;
+  const resolvedProject = scopeAll
+    ? (project?.toLowerCase() ?? null)
     : (project ?? detectProject(cwd))?.toLowerCase() ?? null;
   const startTime = Date.now();
   const safeQuery = sanitizeFtsQuery(query);

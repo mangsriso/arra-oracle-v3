@@ -28,6 +28,13 @@ export const DB_PATH = process.env.ORACLE_DB_PATH || path.join(ORACLE_DATA_DIR, 
 export const REPO_ROOT = process.env.ORACLE_REPO_ROOT ||
   (fs.existsSync(path.join(PROJECT_ROOT, 'ψ')) ? PROJECT_ROOT : ORACLE_DATA_DIR);
 
+// Search scope: 'all' = universal (no cwd auto-scoping), 'project' = legacy (cwd auto-detect)
+export const ORACLE_SEARCH_SCOPE = process.env.ORACLE_SEARCH_SCOPE || 'project';
+
+if (!['all', 'project'].includes(ORACLE_SEARCH_SCOPE)) {
+  console.warn(`[Config] Unknown ORACLE_SEARCH_SCOPE="${ORACLE_SEARCH_SCOPE}", falling back to "project" behavior`);
+}
+
 // Ensure data directory exists (for fresh installs via bunx)
 if (!fs.existsSync(ORACLE_DATA_DIR)) {
   fs.mkdirSync(ORACLE_DATA_DIR, { recursive: true });

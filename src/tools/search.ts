@@ -9,6 +9,7 @@
 import { logSearch } from '../server/logging.ts';
 import { detectProject } from '../server/project-detect.ts';
 import { ensureVectorStoreConnected } from '../vector/factory.ts';
+import { ORACLE_SEARCH_SCOPE } from '../config.ts';
 import type { ToolContext, ToolResponse, OracleSearchInput } from './types.ts';
 
 export const searchToolDef = {
@@ -324,10 +325,12 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
 
   const safeQuery = sanitizeFtsQuery(query);
 
-  // Auto-detect project from cwd if not explicitly specified
-  // all_projects bypasses project scoping for cross-oracle search
-  const resolvedProject = all_projects
-    ? null
+  // Auto-detect project from cwd if not explicitly specified.
+  // ORACLE_SEARCH_SCOPE=all or all_projects bypasses cwd auto-detection,
+  // but an explicit `project` param still scopes the search.
+  const scopeAll = ORACLE_SEARCH_SCOPE === 'all' || all_projects;
+  const resolvedProject = scopeAll
+    ? (project?.toLowerCase() ?? null)
     : (project ?? detectProject(cwd))?.toLowerCase() ?? null;
 
   // Project filter: if project specified, include project + universal (NULL)
