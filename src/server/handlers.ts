@@ -47,6 +47,9 @@ export async function handleSearch(
     : (project ?? detectProject(cwd))?.toLowerCase() ?? null;
   const startTime = Date.now();
   const safeQuery = sanitizeFtsQuery(query);
+  if (!safeQuery) {
+    return { results: [], total: 0, limit, offset, query };
+  }
 
   let warning: string | undefined;
 
