@@ -182,16 +182,21 @@ function escapeHtml(s) {
 
 function orgColor(org) {
   const colors = {
-    'laris-co': { bg: 'violet', hex: '#8b5cf6' },
-    'soul-brews-studio': { bg: 'emerald', hex: '#10b981' },
-    'nazt': { bg: 'amber', hex: '#f59e0b' },
-    'arthur-oracle-ai': { bg: 'blue', hex: '#3b82f6' },
-    'oracle-net-the-resonance-network': { bg: 'rose', hex: '#f43f5e' },
-    'prakit-advertising': { bg: 'teal', hex: '#14b8a6' },
-    'maeon-lab': { bg: 'indigo', hex: '#6366f1' },
-    'dryoungdo-wellness-clinic': { bg: 'orange', hex: '#f97316' },
   };
-  return colors[org] || { bg: 'gray', hex: '#6b7280' };
+  // Dynamic color assignment based on org name hash
+  const colorPalette = [
+    { bg: 'violet', hex: '#8b5cf6' },
+    { bg: 'emerald', hex: '#10b981' },
+    { bg: 'amber', hex: '#f59e0b' },
+    { bg: 'blue', hex: '#3b82f6' },
+    { bg: 'rose', hex: '#f43f5e' },
+    { bg: 'teal', hex: '#14b8a6' },
+    { bg: 'indigo', hex: '#6366f1' },
+    { bg: 'orange', hex: '#f97316' },
+  ];
+  // Simple hash to assign consistent colors
+  const hash = org.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
+  return colorPalette[hash % colorPalette.length] || { bg: 'gray', hex: '#6b7280' };
 }
 
 // ── HTML Generator ───────────────────────────────────────────────────────────
@@ -413,7 +418,7 @@ function generateHTML() {
     </div>` : ''}
 
     <footer class="text-center text-gray-600 text-[10px] py-3 border-t border-white/5">
-      <a href="https://github.com/Soul-Brews-Studio/arra-oracle-v3" class="text-gray-500 hover:text-gray-300">arra-oracle-v3</a> &middot; <span class="font-mono">${generated}</span>
+      <a href="https://github.com/Soul-Brews-Studio/arra-oracle-v2" class="text-gray-500 hover:text-gray-300">arra-oracle-v2</a> &middot; <span class="font-mono">${generated}</span>
     </footer>
   </div>
 </body>
