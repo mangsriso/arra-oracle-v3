@@ -83,11 +83,21 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
   readonly dimensions: number;
   private apiKey: string;
   private model: string;
+  private baseUrl: string;
 
-  constructor(config: { apiKey?: string; model?: string } = {}) {
-    this.apiKey = config.apiKey || process.env.OPENAI_API_KEY || '';
+  constructor(config: { apiKey?: string; model?: string; baseUrl?: string } = {}) {
+    this.apiKey = config.apiKey || process.env.ORACLE_OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
+    this.baseUrl = config.baseUrl || process.env.ORACLE_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
     this.model = config.model || 'text-embedding-3-small';
-    this.dimensions = this.model === 'text-embedding-3-large' ? 3072 : 1536;
+
+    // Known model dimensions
+    const KNOWN_DIMS: Record<string, number> = {
+      'text-embedding-3-large': 3072,
+      'text-embedding-3-small': 1536,
+      'BAAI/bge-m3': 1024,
+      'bge-m3': 1024,
+    };
+    this.dimensions = KNOWN_DIMS[this.model] || 1536;
 
     if (!this.apiKey) {
       throw new Error('OpenAI API key required. Set OPENAI_API_KEY.');
@@ -95,7 +105,7 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
   }
 
   async embed(texts: string[]): Promise<number[][]> {
-    const response = await fetch('https://api.openai.com/v1/embeddings', {
+    const response = await fetch(`${this.baseUrl}/embeddings`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,

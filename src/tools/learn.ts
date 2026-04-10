@@ -10,6 +10,7 @@ import fs from 'fs';
 import { oracleDocuments } from '../db/schema.ts';
 import { detectProject } from '../server/project-detect.ts';
 import { getVaultPsiRoot } from '../vault/handler.ts';
+import { ensureVectorStoreConnected } from '../vector/factory.ts';
 import type { ToolContext, ToolResponse, OracleLearnInput } from './types.ts';
 
 /** Coerce concepts to string[] — handles string, array, or undefined from MCP input */
@@ -193,6 +194,23 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
     INSERT INTO oracle_fts (id, content, concepts)
     VALUES (?, ?, ?)
   `).run(id, frontmatter, conceptsList.join(' '));
+
+  // Add to vector store for immediate semantic search (best-effort)
+  try {
+    const vectorStore = await ensureVectorStoreConnected('bge-m3');
+    await vectorStore.addDocuments([{
+      id,
+      document: frontmatter,
+      metadata: {
+        type: 'learning',
+        source_file: sourceFileRel,
+        concepts: conceptsList.join(','),
+        project: dbProject ?? '',
+      },
+    }]);
+  } catch (e) {
+    console.error('[arra_learn] Vector indexing failed (FTS still works):', e instanceof Error ? e.message : String(e));
+  }
 
   return {
     content: [{

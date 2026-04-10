@@ -167,7 +167,8 @@ const modelStoreCache = new Map<string, VectorStoreAdapter>();
 
 /**
  * Get a vector store for a specific embedding model.
- * Uses LanceDB + Ollama. Caches instances by model key.
+ * Uses LanceDB + env-configured embedding provider (default: ollama).
+ * Caches instances by model key.
  */
 const connectPromises = new Map<string, Promise<void>>();
 
@@ -177,11 +178,13 @@ export function getVectorStoreByModel(model?: string): VectorStoreAdapter {
   let store = modelStoreCache.get(key);
   if (!store) {
     const preset = models[key];
+    const provider = (process.env.ORACLE_EMBEDDING_PROVIDER as EmbeddingProviderType) || 'ollama';
+    const embeddingModel = process.env.ORACLE_EMBEDDING_MODEL || preset.model;
     store = createVectorStore({
       type: 'lancedb',
       collectionName: preset.collection,
-      embeddingProvider: 'ollama',
-      embeddingModel: preset.model,
+      embeddingProvider: provider,
+      embeddingModel,
       ...(preset.dataPath && { dataPath: preset.dataPath }),
     });
     modelStoreCache.set(key, store);

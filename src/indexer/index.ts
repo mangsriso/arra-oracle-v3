@@ -80,7 +80,12 @@ export class OracleIndexer {
 
     // Initialize vector store
     try {
-      this.vectorClient = createVectorStore({ dataPath: this.config.chromaPath });
+      this.vectorClient = createVectorStore({
+        dataPath: this.config.chromaPath,
+        embeddingProvider: process.env.ORACLE_EMBEDDING_PROVIDER as any || 'ollama',
+        embeddingModel: process.env.ORACLE_EMBEDDING_MODEL || 'bge-m3',
+        collectionName: 'oracle_knowledge_bge_m3',
+      });
       await this.vectorClient.connect();
       await this.vectorClient.deleteCollection();
       await this.vectorClient.ensureCollection();
