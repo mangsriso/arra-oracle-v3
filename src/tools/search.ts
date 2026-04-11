@@ -112,7 +112,8 @@ export function parseConceptsFromMetadata(concepts: unknown): string[] {
       const parsed = JSON.parse(concepts);
       return Array.isArray(parsed) ? parsed : [];
     } catch {
-      return [];
+      // Fallback: comma-separated string from LanceDB metadata (storage.ts joins with ',')
+      return concepts.split(',').map((s: string) => s.trim()).filter(Boolean);
     }
   }
   return [];

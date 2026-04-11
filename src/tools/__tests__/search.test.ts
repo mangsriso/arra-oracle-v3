@@ -108,8 +108,10 @@ describe('parseConceptsFromMetadata', () => {
     expect(parseConceptsFromMetadata('["trust","safety"]')).toEqual(['trust', 'safety']);
   });
 
-  it('should return empty for invalid JSON', () => {
-    expect(parseConceptsFromMetadata('not json')).toEqual([]);
+  it('should split comma-separated strings (LanceDB metadata format)', () => {
+    expect(parseConceptsFromMetadata('not json')).toEqual(['not json']);
+    expect(parseConceptsFromMetadata('pattern,decision,oracle')).toEqual(['pattern', 'decision', 'oracle']);
+    expect(parseConceptsFromMetadata('')).toEqual([]);
   });
 });
 
