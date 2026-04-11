@@ -113,7 +113,6 @@ class OracleMCPServer {
 
     this.setupHandlers();
     this.setupErrorHandling();
-    this.verifyVectorHealth();
   }
 
   /** Build ToolContext from server state */
@@ -285,6 +284,7 @@ class OracleMCPServer {
 
   async preConnectVector(): Promise<void> {
     await this.vectorStore.connect();
+    await this.verifyVectorHealth();
   }
 
   async run(): Promise<void> {

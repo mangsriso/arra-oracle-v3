@@ -190,6 +190,8 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
     createdBy: 'arra_learn',
   }).run();
 
+  // FTS5 doesn't support REPLACE — delete first to prevent duplicates
+  ctx.sqlite.prepare('DELETE FROM oracle_fts WHERE id = ?').run(id);
   ctx.sqlite.prepare(`
     INSERT INTO oracle_fts (id, content, concepts)
     VALUES (?, ?, ?)

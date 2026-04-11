@@ -22,11 +22,10 @@ export async function storeDocuments(
 ): Promise<void> {
   const now = Date.now();
 
-  // Prepare FTS statement (raw SQL required for FTS5)
-  const insertFts = sqlite.prepare(`
-    INSERT OR REPLACE INTO oracle_fts (id, content, concepts)
-    VALUES (?, ?, ?)
-  `);
+  // Prepare FTS statements (raw SQL required for FTS5)
+  // FTS5 doesn't support REPLACE — must DELETE then INSERT to avoid duplicates
+  const deleteFts = sqlite.prepare('DELETE FROM oracle_fts WHERE id = ?');
+  const insertFts = sqlite.prepare('INSERT INTO oracle_fts (id, content, concepts) VALUES (?, ?, ?)');
 
   // Prepare for vector store
   const ids: string[] = [];
@@ -66,7 +65,8 @@ export async function storeDocuments(
         })
         .run();
 
-      // SQLite FTS (raw SQL required for FTS5)
+      // SQLite FTS — delete first to prevent duplicates (FTS5 has no REPLACE)
+      deleteFts.run(doc.id);
       insertFts.run(
         doc.id,
         doc.content,
