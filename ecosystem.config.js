@@ -4,7 +4,7 @@ module.exports = {
     script: 'src/server.ts',
     interpreter: 'bun',
     env: {
-      ORACLE_PORT: 47779,
+      ORACLE_PORT: 47778,
       ORACLE_VECTOR_DB: 'lancedb',
     },
   }],

@@ -17,6 +17,11 @@ export type {
   OracleInboxInput,
   OracleReadInput,
 } from './types.ts';
+export type {
+  CreateTraceInput,
+  ListTracesInput,
+  GetTraceInput,
+} from '../trace/types.ts';
 
 // Search (+ pure helpers)
 export {
@@ -83,4 +88,3 @@ export {
   handleTraceUnlink,
   handleTraceChain,
 } from './trace.ts';
-

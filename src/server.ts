@@ -17,8 +17,10 @@ import {
   performGracefulShutdown,
 } from './process-manager/index.ts';
 
-import { PORT, ORACLE_DATA_DIR } from './config.ts';
-import { db, closeDb, indexingStatus } from './db/index.ts';
+import { PORT, ORACLE_DATA_DIR, REPO_ROOT } from './config.ts';
+import { db, sqlite, closeDb, indexingStatus } from './db/index.ts';
+import { getVectorStoreByModel, ensureVectorStoreConnected } from './vector/factory.ts';
+import type { ToolContext } from './tools/index.ts';
 
 // Route modules
 import { registerAuthRoutes } from './routes/auth.ts';
@@ -33,6 +35,7 @@ import { registerTraceRoutes } from './routes/traces.ts';
 import { registerKnowledgeRoutes } from './routes/knowledge.ts';
 import { registerSupersedeRoutes } from './routes/supersede.ts';
 import { registerFileRoutes } from './routes/files.ts';
+import { registerMcpRoutes } from './routes/mcp.ts';
 
 // Reset stale indexing status on startup using Drizzle
 try {
@@ -105,6 +108,29 @@ registerKnowledgeRoutes(app);
 registerSupersedeRoutes(app);
 registerFileRoutes(app);
 
+const vectorStore = getVectorStoreByModel('bge-m3');
+let vectorStatus: ToolContext['vectorStatus'] = 'unknown';
+
+try {
+  await ensureVectorStoreConnected('bge-m3');
+  const stats = await vectorStore.getStats();
+  vectorStatus = stats.count > 0 ? 'connected' : 'empty';
+} catch {
+  vectorStatus = 'unavailable';
+}
+
+const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as { version?: string };
+const mcpCtx: ToolContext = {
+  db,
+  sqlite,
+  repoRoot: REPO_ROOT,
+  vectorStore,
+  vectorStatus,
+  version: typeof pkg.version === 'string' ? pkg.version : '0.0.0',
+};
+
+registerMcpRoutes(app, mcpCtx);
+
 // Startup banner
 console.log(`
 🔮 Arra Oracle HTTP Server running! (Hono.js)
@@ -132,9 +158,14 @@ console.log(`
    - GET  /api/supersede       List supersessions
    - GET  /api/supersede/chain/:path  Document lineage
    - POST /api/supersede       Log supersession
+
+   MCP (stdio proxy):
+   - POST /mcp/tools           List available MCP tools
+   - POST /mcp/call            Call an MCP tool
 `);
 
 export default {
   port: Number(PORT),
+  hostname: '127.0.0.1',
   fetch: app.fetch,
 };
