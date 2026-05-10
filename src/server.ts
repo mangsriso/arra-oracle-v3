@@ -1,12 +1,13 @@
 /**
- * Arra Oracle HTTP Server - Hono.js Version
+ * Arra Oracle HTTP Server — Elysia (bun-native).
  *
- * Modern routing with Hono.js on Bun runtime.
- * Routes split into modules under src/routes/.
+ * Composes 15 route modules from src/routes/. Every module is its own
+ * Elysia sub-app, nested one file per endpoint.
  */
 
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
+import { Elysia } from 'elysia';
+import { cors } from '@elysiajs/cors';
+import { swagger } from '@elysiajs/swagger';
 import { eq } from 'drizzle-orm';
 
 import {
@@ -17,155 +18,222 @@ import {
   performGracefulShutdown,
 } from './process-manager/index.ts';
 
-import { PORT, ORACLE_DATA_DIR, REPO_ROOT } from './config.ts';
+import { PORT, ORACLE_DATA_DIR, VECTOR_URL } from './config.ts';
+import { MCP_SERVER_NAME } from './const.ts';
 import { db, sqlite, closeDb, indexingStatus } from './db/index.ts';
-import { getVectorStoreByModel, ensureVectorStoreConnected } from './vector/factory.ts';
-import type { ToolContext } from './tools/index.ts';
+import { seedMenuItems, type HasRoutes as SeedHasRoutes } from './db/seeders/menu-seeder.ts';
 
-// Route modules
-import { registerAuthRoutes } from './routes/auth.ts';
-import { registerSettingsRoutes } from './routes/settings.ts';
-import { registerHealthRoutes } from './routes/health.ts';
-import { registerSearchRoutes } from './routes/search.ts';
-import { registerFeedRoutes } from './routes/feed.ts';
-import { registerDashboardRoutes } from './routes/dashboard.ts';
-import { registerForumRoutes } from './routes/forum.ts';
-import { registerScheduleRoutes } from './routes/schedule.ts';
-import { registerTraceRoutes } from './routes/traces.ts';
-import { registerKnowledgeRoutes } from './routes/knowledge.ts';
-import { registerSupersedeRoutes } from './routes/supersede.ts';
-import { registerFileRoutes } from './routes/files.ts';
-import { registerMcpRoutes } from './routes/mcp.ts';
+// Elysia sub-apps — one per cluster
+import { authRoutes } from './routes/auth/index.ts';
+import { settingsRoutes } from './routes/settings/index.ts';
+import { feedRoutes } from './routes/feed/index.ts';
+import { healthRoutes } from './routes/health/index.ts';
+import { dashboardRoutes } from './routes/dashboard/index.ts';
+import { searchRoutes } from './routes/search/index.ts';
+import { vectorRoutes } from './routes/vector/index.ts';
+import { knowledgeRoutes } from './routes/knowledge/index.ts';
+import { supersedeRoutes } from './routes/supersede/index.ts';
+import { forumApi } from './routes/forum/index.ts';
+import { tracesApi } from './routes/traces/index.ts';
+import { scheduleApi } from './routes/schedule/index.ts';
+import { filesRouter } from './routes/files/index.ts';
+import { pluginsRouter } from './routes/plugins/index.ts';
+import { oraclenetRoutes } from './routes/oraclenet/index.ts';
+import { sessionsRoutes } from './routes/sessions/index.ts';
+import { vaultRoutes } from './routes/vault/index.ts';
+import { indexerRoutes } from './routes/indexer/index.ts';
+import { createMenuRoutes } from './routes/menu/index.ts';
+import { gatewayPlugin } from './gateway/index.ts';
 
-// Reset stale indexing status on startup using Drizzle
+import pkg from '../package.json' with { type: 'json' };
+
 try {
-  db.update(indexingStatus)
-    .set({ isIndexing: 0 })
-    .where(eq(indexingStatus.id, 1))
-    .run();
+  db.update(indexingStatus).set({ isIndexing: 0 }).where(eq(indexingStatus.id, 1)).run();
   console.log('🔮 Reset indexing status on startup');
 } catch (e) {
-  // Table might not exist yet - that's fine
+  // table might not exist yet — fine on first boot
 }
 
-// Configure process lifecycle management
+console.log('[Vector] mode:', VECTOR_URL ? 'proxy → ' + VECTOR_URL : 'local');
+
+try {
+  const bt = sqlite.prepare('PRAGMA busy_timeout').get();
+  console.log(`[DB] busy_timeout = ${JSON.stringify(bt)}`);
+} catch {}
+
 configure({ dataDir: ORACLE_DATA_DIR, pidFileName: 'oracle-http.pid' });
+writePidFile({
+  pid: process.pid,
+  port: Number(PORT),
+  startedAt: new Date().toISOString(),
+  name: 'oracle-http',
+});
 
-// Write PID file for process tracking
-writePidFile({ pid: process.pid, port: Number(PORT), startedAt: new Date().toISOString(), name: 'oracle-http' });
-
-// Register graceful shutdown handlers
 registerSignalHandlers(async () => {
   console.log('\n🔮 Shutting down gracefully...');
   await performGracefulShutdown({
-    resources: [
-      { close: () => { closeDb(); return Promise.resolve(); } }
-    ]
+    resources: [{ close: () => { closeDb(); return Promise.resolve(); } }],
   });
   removePidFile();
   console.log('👋 Arra Oracle HTTP Server stopped.');
 });
 
-// Create Hono app
-const app = new Hono();
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://studio.buildwithoracle.com',
+  'https://neo.buildwithoracle.com',
+];
+const envExtraOrigins = (process.env.ORACLE_CORS_ORIGIN ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const legacyOrigin = process.env.CORS_ORIGIN?.trim();
+const ALLOWED_ORIGINS = [
+  ...DEFAULT_ALLOWED_ORIGINS,
+  ...envExtraOrigins,
+  ...(legacyOrigin ? [legacyOrigin] : []),
+];
 
-// CORS middleware — restrict to same-origin in production
-app.use('*', cors({
-  origin: (origin) => {
-    // Allow same-origin (no origin header) and localhost variants
-    if (!origin) return origin;
-    if (origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) {
+function originAllowed(origin: string | undefined | null): string | null {
+  if (!origin) return null;
+  if (origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) {
+    return origin;
+  }
+  if (ALLOWED_ORIGINS.includes(origin)) return origin;
+  try {
+    const { hostname, protocol } = new URL(origin);
+    if (protocol === 'https:' && (hostname === 'buildwithoracle.com' || hostname.endsWith('.buildwithoracle.com'))) {
       return origin;
     }
-    // In production, only allow configured origin
-    const allowedOrigin = process.env.CORS_ORIGIN;
-    if (allowedOrigin && origin === allowedOrigin) return origin;
-    return null; // Reject unknown origins
-  },
-  credentials: true,
-}));
-
-// Security headers middleware
-app.use('*', async (c, next) => {
-  await next();
-  c.header('X-Content-Type-Options', 'nosniff');
-  c.header('X-Frame-Options', 'DENY');
-  c.header('X-XSS-Protection', '1; mode=block');
-  c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
-});
-
-// Register all route modules (order matters: auth middleware first)
-registerAuthRoutes(app);
-registerSettingsRoutes(app);
-registerHealthRoutes(app);
-registerSearchRoutes(app);
-registerFeedRoutes(app);
-registerDashboardRoutes(app);
-registerForumRoutes(app);
-registerScheduleRoutes(app);
-registerTraceRoutes(app);
-registerKnowledgeRoutes(app);
-registerSupersedeRoutes(app);
-registerFileRoutes(app);
-
-const vectorStore = getVectorStoreByModel('bge-m3');
-let vectorStatus: ToolContext['vectorStatus'] = 'unknown';
-
-try {
-  await ensureVectorStoreConnected('bge-m3');
-  const stats = await vectorStore.getStats();
-  vectorStatus = stats.count > 0 ? 'connected' : 'empty';
-} catch {
-  vectorStatus = 'unavailable';
+  } catch {}
+  return null;
 }
 
-const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as { version?: string };
-const mcpCtx: ToolContext = {
-  db,
-  sqlite,
-  repoRoot: REPO_ROOT,
-  vectorStore,
-  vectorStatus,
-  version: typeof pkg.version === 'string' ? pkg.version : '0.0.0',
-};
+// Private Network Access preflight (Chrome 117+). Must intercept OPTIONS
+// before @elysiajs/cors, because the cors plugin answers preflights itself
+// without emitting the `Access-Control-Allow-Private-Network` header that
+// Chrome requires for https→localhost fetches.
+const pnaMiddleware = new Elysia().onRequest(({ request }) => {
+  if (
+    request.method === 'OPTIONS' &&
+    request.headers.get('access-control-request-private-network') === 'true'
+  ) {
+    const origin = originAllowed(request.headers.get('origin'));
+    if (!origin) return;
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Allow-Credentials': 'true',
+        'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,PATCH,OPTIONS',
+        'Access-Control-Allow-Headers':
+          request.headers.get('access-control-request-headers') ?? 'content-type',
+        'Access-Control-Allow-Private-Network': 'true',
+        'Access-Control-Max-Age': '86400',
+        Vary: 'Origin',
+      },
+    });
+  }
+});
 
-registerMcpRoutes(app, mcpCtx);
+const app = new Elysia()
+  .use(pnaMiddleware)
+  .use(
+    cors({
+      origin: (request) => {
+        const origin = request.headers.get('origin');
+        return originAllowed(origin) !== null;
+      },
+      credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    }),
+  )
+  .onAfterHandle(({ set }) => {
+    set.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate';
+    set.headers['X-Content-Type-Options'] = 'nosniff';
+    set.headers['X-Frame-Options'] = 'DENY';
+    set.headers['X-XSS-Protection'] = '1; mode=block';
+    set.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin';
+  })
+  .onError(({ code, error, set }) => {
+    if (code === 'NOT_FOUND') {
+      set.status = 404;
+      return { error: 'Not found' };
+    }
+    const msg = (error as any)?.message ?? String(error);
+    const isDbLock = msg.includes('disk I/O') || msg.includes('database is locked') || msg.includes('SQLITE_BUSY');
+    if (isDbLock) {
+      set.status = 503;
+      return { error: 'Database temporarily unavailable (indexing in progress)', indexing: true, detail: msg };
+    }
+    set.status = 500;
+    return { error: msg };
+  })
+  .use(
+    swagger({
+      path: '/swagger',
+      documentation: {
+        info: {
+          title: 'Arra Oracle API',
+          version: pkg.version,
+          description: 'HTTP API for the Arra Oracle MCP memory layer.',
+        },
+      },
+    }),
+  )
+  .use(gatewayPlugin(ORACLE_DATA_DIR, VECTOR_URL || undefined))
+  .get('/', () => ({
+    server: MCP_SERVER_NAME,
+    version: pkg.version,
+    status: 'ok',
+    docs: '/swagger',
+    api: '/api',
+  }));
 
-// Startup banner
+const apiModules = [
+  authRoutes,
+  settingsRoutes,
+  feedRoutes,
+  healthRoutes,
+  dashboardRoutes,
+  searchRoutes,
+  vectorRoutes,
+  knowledgeRoutes,
+  supersedeRoutes,
+  forumApi,
+  tracesApi,
+  scheduleApi,
+  filesRouter,
+  pluginsRouter,
+  oraclenetRoutes,
+  sessionsRoutes,
+  vaultRoutes,
+  indexerRoutes,
+];
+
+try {
+  const result = seedMenuItems(apiModules as unknown as SeedHasRoutes[]);
+  console.log(
+    `🔮 Menu seeded: ${result.inserted} inserted, ${result.updated} updated, ${result.preserved} preserved`,
+  );
+} catch (e) {
+  console.error('⚠️  Menu seeder failed:', e);
+}
+
+const menuRoutes = createMenuRoutes();
+
+const modules = [...apiModules, menuRoutes];
+
+for (const mod of modules) app.use(mod as any);
+
 console.log(`
-🔮 Arra Oracle HTTP Server running! (Hono.js)
+🔮 Arra Oracle HTTP Server running! (Elysia)
 
-   URL: http://localhost:${PORT}
-
-   Endpoints:
-   - GET  /api/health          Health check
-   - GET  /api/search?q=...    Search Oracle knowledge
-   - GET  /api/list            Browse all documents
-   - GET  /api/reflect         Random wisdom
-   - GET  /api/stats           Database statistics
-   - GET  /api/graph           Knowledge graph data
-   - GET  /api/map             Knowledge map 2D (hash-based layout)
-   - GET  /api/map3d           Knowledge map 3D (real PCA from LanceDB embeddings)
-   - GET  /api/context         Project context (ghq format)
-   - POST /api/learn           Add new pattern/learning
-
-   Forum:
-   - GET  /api/threads         List threads
-   - GET  /api/thread/:id      Get thread
-   - POST /api/thread          Send message
-
-   Supersede Log:
-   - GET  /api/supersede       List supersessions
-   - GET  /api/supersede/chain/:path  Document lineage
-   - POST /api/supersede       Log supersession
-
-   MCP (stdio proxy):
-   - POST /mcp/tools           List available MCP tools
-   - POST /mcp/call            Call an MCP tool
+   URL:     http://localhost:${PORT}
+   Swagger: http://localhost:${PORT}/swagger
+   Version: ${pkg.version}
 `);
 
 export default {
   port: Number(PORT),
-  hostname: '127.0.0.1',
   fetch: app.fetch,
 };

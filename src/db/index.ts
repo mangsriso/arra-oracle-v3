@@ -35,6 +35,39 @@ export function initFts5(sqliteDb: Database): void {
 }
 
 /**
+ * Initialize supersede_log table (migration 0003)
+ * Added to fix existing installations missing this table.
+ * Idempotent - safe to call on every startup.
+ */
+export function initSupersedeLog(sqliteDb: Database): void {
+  // Create table
+  sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS supersede_log (
+      id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+      old_path text NOT NULL,
+      old_id text,
+      old_title text,
+      old_type text,
+      new_path text,
+      new_id text,
+      new_title text,
+      reason text,
+      superseded_at integer NOT NULL,
+      superseded_by text,
+      project text
+    )
+  `);
+
+  // Create indexes
+  sqliteDb.exec(`
+    CREATE INDEX IF NOT EXISTS idx_supersede_old_path ON supersede_log (old_path);
+    CREATE INDEX IF NOT EXISTS idx_supersede_new_path ON supersede_log (new_path);
+    CREATE INDEX IF NOT EXISTS idx_supersede_created ON supersede_log (superseded_at);
+    CREATE INDEX IF NOT EXISTS idx_supersede_project ON supersede_log (project);
+  `);
+}
+
+/**
  * Initialize a database: run migrations, create FTS5, seed indexing_status.
  */
 function initializeDatabase(sqliteDb: Database, drizzleDb: BunSQLiteDatabase<typeof schema>): void {
@@ -47,6 +80,9 @@ function initializeDatabase(sqliteDb: Database, drizzleDb: BunSQLiteDatabase<typ
 
   // FTS5 (raw SQL, idempotent)
   initFts5(sqliteDb);
+
+  // Supersede log table (migration 0003 - idempotent for existing DBs)
+  initSupersedeLog(sqliteDb);
 
   // Ensure indexing_status has its single row
   sqliteDb.exec('INSERT OR IGNORE INTO indexing_status (id, is_indexing) VALUES (1, 0)');
@@ -92,11 +128,18 @@ if (!fs.existsSync(ORACLE_DATA_DIR)) {
   fs.mkdirSync(ORACLE_DATA_DIR, { recursive: true });
 }
 
-const defaultSqlite = new Database(DB_PATH);
+const isReadonly = process.env.ORACLE_VECTOR_READONLY === '1';
+const defaultSqlite = isReadonly
+  ? new Database(DB_PATH, { readonly: true })
+  : new Database(DB_PATH);
 const defaultDb = drizzle(defaultSqlite, { schema });
 
-// Run initialization on the default connection
-initializeDatabase(defaultSqlite, defaultDb);
+if (isReadonly) {
+  console.log('[DB] Opened in READONLY mode (vector sidecar)');
+} else {
+  // Run initialization on the default connection (skipped in readonly mode)
+  initializeDatabase(defaultSqlite, defaultDb);
+}
 
 export const sqlite = defaultSqlite;
 export const db = defaultDb;
@@ -109,6 +152,23 @@ export * from './schema.ts';
  */
 export function closeDb() {
   defaultSqlite.close();
+}
+
+// ============================================================================
+// Error helpers
+// ============================================================================
+
+/**
+ * Detect SQLite contention errors that can occur while the indexer holds
+ * a write lock long enough to trip bun:sqlite's busy_timeout.
+ *
+ * Mirrors the matching logic in the global Elysia .onError() handler
+ * (see src/server.ts) so individual endpoints can return graceful
+ * fallbacks instead of relying on the 503 catch-all.
+ */
+export function isDbLockError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('disk I/O') || msg.includes('SQLITE_BUSY') || msg.includes('database is locked');
 }
 
 // ============================================================================

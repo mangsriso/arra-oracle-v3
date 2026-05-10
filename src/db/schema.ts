@@ -5,7 +5,8 @@
  * then cleaned up to exclude FTS5 internal tables.
  */
 
-import { sqliteTable, text, integer, index } from 'drizzle-orm/sqlite-core';
+import { sql } from 'drizzle-orm';
+import { sqliteTable, text, integer, index, type AnySQLiteColumn } from 'drizzle-orm/sqlite-core';
 
 // Main document index table
 export const oracleDocuments = sqliteTable('oracle_documents', {
@@ -44,6 +45,27 @@ export const indexingStatus = sqliteTable('indexing_status', {
   repoRoot: text('repo_root'),  // Root directory being indexed
 });
 
+// Per-doc per-model index job queue.
+// Foundation for the indexer-CLI / FTS-first / vector-later split — a doc gets
+// FTS5-inserted synchronously, then one row per registered model lands here for
+// the daemon to embed asynchronously. Plug-and-play: adding/removing a model
+// adds/skips queue entries without touching oracle_documents or other models'
+// LanceDB collections. Design: ψ/lab/indexer-cli/DESIGN.md (M1).
+export const indexingJobs = sqliteTable('indexing_jobs', {
+  id: text('id').primaryKey(),                                  // "idx-<ts>-<modelKey>-<rand>"
+  docId: text('doc_id').notNull(),                              // FK to oracle_documents.id
+  modelKey: text('model_key').notNull(),                        // "bge-m3", "qwen3", ...
+  collection: text('collection').notNull(),                     // "oracle_knowledge_bge_m3"
+  status: text('status').default('pending').notNull(),          // pending | claimed | done | error
+  attempts: integer('attempts').default(0).notNull(),
+  createdAt: integer('created_at')
+    .default(sql`(strftime('%s','now')*1000)`)
+    .notNull(),
+  claimedAt: integer('claimed_at'),
+  finishedAt: integer('finished_at'),
+  error: text('error'),
+});
+
 // Search query logging
 export const searchLog = sqliteTable('search_log', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -58,6 +80,22 @@ export const searchLog = sqliteTable('search_log', {
 }, (table) => [
   index('idx_search_project').on(table.project),
   index('idx_search_created').on(table.createdAt),
+]);
+
+// Consult log — legacy table kept for backward compat (pre-0007 snapshot had it).
+// Not actively used; retained to avoid destructive migration drop.
+export const consultLog = sqliteTable('consult_log', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  decision: text('decision').notNull(),
+  context: text('context'),
+  principlesFound: integer('principles_found').notNull(),
+  patternsFound: integer('patterns_found').notNull(),
+  guidance: text('guidance').notNull(),
+  createdAt: integer('created_at').notNull(),
+  project: text('project'),
+}, (table) => [
+  index('idx_consult_project').on(table.project),
+  index('idx_consult_created').on(table.createdAt),
 ]);
 
 // Learning/pattern logging
@@ -273,3 +311,31 @@ export const settings = sqliteTable('settings', {
   value: text('value'),
   updatedAt: integer('updated_at').notNull(),
 });
+
+// ============================================================================
+// Menu Items Table — studio navigation, seeded from route detail.menu metadata
+// ============================================================================
+
+export const menuItems = sqliteTable('menu_items', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  path: text('path').notNull(),
+  label: text('label').notNull(),
+  groupKey: text('group_key').notNull(),
+  parentId: integer('parent_id').references((): AnySQLiteColumn => menuItems.id, { onDelete: 'cascade' }),
+  position: integer('position').notNull().default(999),
+  enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+  access: text('access').notNull().default('public'),
+  source: text('source').notNull(),
+  icon: text('icon'),
+  host: text('host'),
+  hidden: integer('hidden', { mode: 'boolean' }).notNull().default(false),
+  scope: text('scope').notNull().default('main'),  // 'main' | 'sub' | 'both'
+  query: text('query'),
+  studio: text('studio'),
+  touchedAt: integer('touched_at', { mode: 'timestamp' }),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+}, (t) => [
+  index('idx_menu_parent').on(t.parentId, t.position),
+  index('idx_menu_group').on(t.groupKey, t.position),
+]);

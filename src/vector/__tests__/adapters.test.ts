@@ -14,9 +14,42 @@ import { ChromaMcpAdapter } from '../adapters/chroma-mcp.ts';
 import { LanceDBAdapter } from '../adapters/lancedb.ts';
 import { QdrantAdapter } from '../adapters/qdrant.ts';
 import type { VectorStoreAdapter, VectorDocument } from '../types.ts';
+import { Database } from 'bun:sqlite';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+
+/**
+ * Probe whether the sqlite-vec (vec0) extension can be loaded.
+ * Synchronous — safe for describe.skipIf().
+ *
+ * vec0 SQLite extension not available on deployment hosts (m5, CI).
+ * Tests are permanently skipped rather than deleted so they remain
+ * runnable on machines that DO have the extension installed.
+ */
+function isSqliteVecAvailable(): boolean {
+  let db: Database | null = null;
+  try {
+    db = new Database(':memory:');
+    // Try npm package first
+    try {
+      const sqliteVec = require('sqlite-vec');
+      db.loadExtension(sqliteVec.getLoadablePath());
+      return true;
+    } catch { /* fall through */ }
+    // Try system paths
+    for (const p of ['vec0', '/usr/local/lib/sqlite-vec']) {
+      try { db.loadExtension(p); return true; } catch { /* next */ }
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+}
+
+const SQLITE_VEC_AVAILABLE = isSqliteVecAvailable();
 
 const TEST_DOCS: VectorDocument[] = [
   {
@@ -131,24 +164,36 @@ describe('createVectorStore factory', () => {
 
 // ============================================================================
 // Adapter Interface Compliance: sqlite-vec + Ollama
+// Permanently skipped when vec0 extension is not loadable.
+// vec0 SQLite extension not available on deployment hosts (m5, CI).
 // ============================================================================
 
-describe('SqliteVecAdapter + Ollama', () => {
+describe.skipIf(!SQLITE_VEC_AVAILABLE)('SqliteVecAdapter + Ollama', () => {
   let store: VectorStoreAdapter;
   let tmpDb: string;
   let available = false;
 
-  // Setup
+  // Setup — needs both Ollama AND sqlite-vec extension
   const setup = async () => {
     available = await isOllamaAvailable();
     if (!available) return;
 
     tmpDb = path.join(os.tmpdir(), `oracle-vec-test-${Date.now()}.db`);
-    store = createVectorStore({
-      type: 'sqlite-vec',
-      dataPath: tmpDb,
-      embeddingProvider: 'ollama',
-    });
+    try {
+      store = createVectorStore({
+        type: 'sqlite-vec',
+        dataPath: tmpDb,
+        embeddingProvider: 'ollama',
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('vec0') || msg.includes('no such module')) {
+        console.log('  [SKIP] sqlite-vec extension not available');
+        available = false;
+        return;
+      }
+      throw err;
+    }
   };
 
   afterAll(async () => {
@@ -160,10 +205,20 @@ describe('SqliteVecAdapter + Ollama', () => {
 
   test('connect + ensureCollection', async () => {
     await setup();
-    if (!available) { console.log('  [SKIP] Ollama not available'); return; }
+    if (!available) { console.log('  [SKIP] Ollama or sqlite-vec not available'); return; }
 
-    await store.connect();
-    await store.ensureCollection();
+    try {
+      await store.connect();
+      await store.ensureCollection();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('vec0') || msg.includes('no such module')) {
+        console.log('  [SKIP] sqlite-vec extension not loaded');
+        available = false;
+        return;
+      }
+      throw err;
+    }
 
     const info = await store.getCollectionInfo();
     expect(info.name).toBe('oracle_knowledge');
@@ -240,8 +295,13 @@ describe('SqliteVecAdapter + Ollama', () => {
 });
 
 // ============================================================================
-// ChromaMcpAdapter (if chroma-mcp available)
+// ChromaMcpAdapter
 // ============================================================================
+// Spawns a `uvx chroma-mcp` stdio subprocess. The subprocess cold-start
+// (uv fetching/resolving the Python env) can take several seconds under
+// full-suite concurrency, so each test here needs a timeout well above
+// bun's 5s default. Tests auto-skip if uvx/chroma-mcp is unavailable.
+const CHROMA_TEST_TIMEOUT_MS = 30_000;
 
 describe('ChromaMcpAdapter', () => {
   let store: VectorStoreAdapter;
@@ -275,7 +335,7 @@ describe('ChromaMcpAdapter', () => {
     await store.ensureCollection();
     const info = await store.getCollectionInfo();
     expect(info.name).toBe('oracle_test_adapter');
-  });
+  }, CHROMA_TEST_TIMEOUT_MS);
 
   test('addDocuments + query', async () => {
     if (!chromaAvailable) { console.log('  [SKIP] ChromaDB not available'); return; }
@@ -287,7 +347,7 @@ describe('ChromaMcpAdapter', () => {
     const result = await store.query('git history', 3);
     expect(result.ids.length).toBeGreaterThan(0);
     expect(result.documents.length).toBe(result.ids.length);
-  });
+  }, CHROMA_TEST_TIMEOUT_MS);
 
   test.skip('queryById (pre-existing safeJsonParse single-quote bug)', async () => {
     if (!chromaAvailable) { console.log('  [SKIP] ChromaDB not available'); return; }
@@ -295,7 +355,7 @@ describe('ChromaMcpAdapter', () => {
     const result = await store.queryById('test_1', 2);
     expect(result.ids.length).toBeGreaterThan(0);
     expect(result.ids).not.toContain('test_1');
-  });
+  }, CHROMA_TEST_TIMEOUT_MS);
 });
 
 // ============================================================================

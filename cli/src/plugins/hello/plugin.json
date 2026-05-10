@@ -1,0 +1,16 @@
+{
+  "name": "hello",
+  "version": "1.0.0",
+  "entry": "./index.ts",
+  "sdk": "^0.0.1",
+  "cli": {
+    "command": "hello",
+    "help": "arra-cli hello — sample plugin"
+  },
+  "menu": {
+    "label": "Hello",
+    "group": "tools",
+    "order": 100,
+    "icon": "wave"
+  }
+}

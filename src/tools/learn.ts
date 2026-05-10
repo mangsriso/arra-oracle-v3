@@ -10,7 +10,9 @@ import fs from 'fs';
 import { oracleDocuments } from '../db/schema.ts';
 import { detectProject } from '../server/project-detect.ts';
 import { getVaultPsiRoot } from '../vault/handler.ts';
-import { ensureVectorStoreConnected } from '../vector/factory.ts';
+import { getVectorStoreByModel, getEmbeddingModels } from '../vector/factory.ts';
+import { enqueueIndexJob } from '../indexer/jobs.ts';
+import { REPO_ROOT } from '../config.ts';
 import type { ToolContext, ToolResponse, OracleLearnInput } from './types.ts';
 
 /** Coerce concepts to string[] — handles string, array, or undefined from MCP input */
@@ -122,18 +124,10 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
   if ('needsInit' in vault) console.error(`[Vault] ${vault.hint}`);
   const vaultRoot = 'path' in vault ? vault.path : null;
 
-  // Decouple file path project from DB project for /learn entries
-  const isLearnSource = source?.match(/^(?:\/)?(?:auto-)?learn[\s:]/i);
-
-  // File path uses explicit/detected project (files go to correct vault dir)
-  const fileProject = normalizeProject(projectInput)
+  const project = normalizeProject(projectInput)
     || extractProjectFromSource(source)
     || detectProject(ctx.repoRoot);
-
-  // DB project is null for /learn entries (universal — discoverable from any oracle)
-  const dbProject = isLearnSource ? null : fileProject;
-
-  const projectDir = (fileProject || '_universal').toLowerCase();
+  const projectDir = (project || '_universal').toLowerCase();
 
   let filePath: string;
   let sourceFileRel: string;
@@ -143,7 +137,10 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
     filePath = path.join(dir, filename);
     sourceFileRel = `${projectDir}/ψ/memory/learnings/${filename}`;
   } else {
-    const dir = path.join(ctx.repoRoot, 'ψ/memory/learnings');
+    // Write to canonical REPO_ROOT, not ctx.repoRoot (the MCP server's cwd):
+    // the dashboard's /api/file resolves source_file against REPO_ROOT, so
+    // writing relative to cwd produces "local file not found" (#557).
+    const dir = path.join(REPO_ROOT, 'ψ/memory/learnings');
     fs.mkdirSync(dir, { recursive: true });
     filePath = path.join(dir, filename);
     sourceFileRel = `ψ/memory/learnings/${filename}`;
@@ -161,7 +158,7 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
     conceptsList.length > 0 ? `tags: [${conceptsList.join(', ')}]` : 'tags: []',
     `created: ${dateStr}`,
     `source: ${source || 'Oracle Learn'}`,
-    ...(dbProject ? [`project: ${dbProject}`] : []),
+    ...(project ? [`project: ${project}`] : []),
     '---',
     '',
     `# ${title}`,
@@ -186,32 +183,55 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
     updatedAt: now.getTime(),
     indexedAt: now.getTime(),
     origin: null,
-    project: dbProject,
+    project,
     createdBy: 'arra_learn',
   }).run();
 
-  // FTS5 doesn't support REPLACE — delete first to prevent duplicates
-  ctx.sqlite.prepare('DELETE FROM oracle_fts WHERE id = ?').run(id);
+  // FTS5 has no unique constraint on id — delete-then-insert to be idempotent.
+  ctx.sqlite.prepare(`DELETE FROM oracle_fts WHERE id = ?`).run(id);
   ctx.sqlite.prepare(`
     INSERT INTO oracle_fts (id, content, concepts)
     VALUES (?, ?, ?)
   `).run(id, frontmatter, conceptsList.join(' '));
 
-  // Add to vector store for immediate semantic search (best-effort)
-  try {
-    const vectorStore = await ensureVectorStoreConnected('bge-m3');
-    await vectorStore.addDocuments([{
-      id,
-      document: frontmatter,
-      metadata: {
-        type: 'learning',
-        source_file: sourceFileRel,
-        concepts: conceptsList.join(','),
-        project: dbProject ?? '',
-      },
-    }]);
-  } catch (e) {
-    console.error('[arra_learn] Vector indexing failed (FTS still works):', e instanceof Error ? e.message : String(e));
+  // Vector indexing — two paths:
+  //   - Default (env unset): inline embed via Ollama. Keeps DB + lancedb in
+  //     step so arra_search hybrid mode works immediately. Graceful fallback
+  //     on embedder failure — FTS row above is still searchable.
+  //   - ORACLE_INDEXER_ENQUEUE=1 (M5 of indexer-CLI): queue a row in
+  //     indexing_jobs for the daemon to embed asynchronously. FTS-first /
+  //     vector-later. Never blocks ingest. Architecture:
+  //     ψ/lab/indexer-cli/DESIGN.md.
+  let embeddingStatus: 'ok' | 'skipped' | 'failed' | 'enqueued' = 'skipped';
+  if (process.env.ORACLE_INDEXER_ENQUEUE === '1') {
+    try {
+      enqueueIndexJob(ctx.sqlite, { docId: id, models: getEmbeddingModels() });
+      embeddingStatus = 'enqueued';
+    } catch (err) {
+      // Never block ingest on the queue — same posture as the inline path.
+      embeddingStatus = 'failed';
+      console.warn(`[arra_learn] enqueue failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  } else {
+    try {
+      const model = process.env.ORACLE_EMBEDDING_MODEL || 'bge-m3';
+      const vectorStore = getVectorStoreByModel(model);
+      await vectorStore.addDocuments([{
+        id,
+        document: frontmatter,
+        metadata: {
+          type: 'learning',
+          source_file: sourceFileRel,
+          project: project || '',
+          concepts: conceptsList.join(','),
+        },
+      }]);
+      embeddingStatus = 'ok';
+    } catch (err) {
+      embeddingStatus = 'failed';
+      console.warn(`[arra_learn] vector embedding failed for ${id}: ${err instanceof Error ? err.message : String(err)}`);
+      console.warn(`[arra_learn] document still searchable via FTS5; run 'bun src/scripts/index-model.ts <model>' later to backfill vectors`);
+    }
   }
 
   return {
@@ -221,7 +241,8 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
         success: true,
         file: sourceFileRel,
         id,
-        message: `Pattern added to Oracle knowledge base${vaultRoot ? ' (vault)' : ''}`
+        embedding: embeddingStatus,
+        message: `Pattern added to Oracle knowledge base${vaultRoot ? ' (vault)' : ''}${embeddingStatus === 'failed' ? ' — vector embedding failed, see server log' : ''}`
       }, null, 2)
     }]
   };

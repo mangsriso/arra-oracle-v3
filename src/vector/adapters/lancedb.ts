@@ -72,28 +72,44 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     if (docs.length === 0) return;
     if (!this.table) await this.ensureCollection();
 
-    const texts = docs.map(d => d.document);
-    const embeddings = await this.embedder.embed(texts);
+    // Embed only the docs that lack a precomputed vector. Callers that
+    // already have a vector (e.g. the indexer worker loop, where embed
+    // happens before the storage write) skip the second Ollama round-trip.
+    const needEmbed: number[] = [];
+    for (let i = 0; i < docs.length; i++) {
+      if (!docs[i].vector) needEmbed.push(i);
+    }
+    let fresh: number[][] = [];
+    if (needEmbed.length > 0) {
+      const texts = needEmbed.map(i => docs[i].document);
+      fresh = await this.embedder.embed(texts, 'passage');
+    }
+    let freshIdx = 0;
 
-    const rows = docs.map((doc, i) => ({
+    const rows = docs.map((doc) => ({
       id: doc.id,
       text: doc.document,
       metadata: JSON.stringify(doc.metadata),
-      vector: embeddings[i],
+      vector: doc.vector ?? fresh[freshIdx++],
     }));
 
     await this.table.add(rows);
-    console.log(`[LanceDB] Added ${docs.length} documents`);
+    const reused = docs.length - needEmbed.length;
+    if (reused > 0) {
+      console.log(`[LanceDB] Added ${docs.length} documents (${reused} with precomputed vectors)`);
+    } else {
+      console.log(`[LanceDB] Added ${docs.length} documents`);
+    }
   }
 
   async query(text: string, limit: number = 10, where?: Record<string, any>): Promise<VectorQueryResult> {
     if (!this.table) await this.ensureCollection();
 
-    const [queryEmbedding] = await this.embedder.embed([text]);
+    const [queryEmbedding] = await this.embedder.embed([text], 'query');
 
     // Fetch extra results if filtering in JS (metadata is stored as string, not binary)
     const fetchLimit = where ? limit * 3 : limit;
-    const results = await this.table.search(queryEmbedding).limit(fetchLimit).toArray();
+    const results = await this.table.search(queryEmbedding).distanceType('cosine').limit(fetchLimit).toArray();
 
     // Filter metadata in JavaScript (LanceDB json_extract requires LargeBinary, not Utf8)
     let filtered = results;
@@ -122,7 +138,7 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     }
 
     const vector = Array.from(rows[0].vector);
-    const results = await this.table.search(vector).limit(nResults + 1).toArray();
+    const results = await this.table.search(vector).distanceType('cosine').limit(nResults + 1).toArray();
 
     const filtered = results.filter((r: any) => r.id !== id).slice(0, nResults);
 

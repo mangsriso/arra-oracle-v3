@@ -8,8 +8,9 @@
 
 import { logSearch } from '../server/logging.ts';
 import { detectProject } from '../server/project-detect.ts';
+import { rerankCandidates } from '../server/reranker.ts';
 import { ensureVectorStoreConnected } from '../vector/factory.ts';
-import { ORACLE_SEARCH_SCOPE } from '../config.ts';
+import type { SearchResult } from '../server/types.ts';
 import type { ToolContext, ToolResponse, OracleSearchInput } from './types.ts';
 
 export const searchToolDef = {
@@ -56,11 +57,6 @@ export const searchToolDef = {
         type: 'string',
         enum: ['nomic', 'qwen3', 'bge-m3'],
         description: 'Embedding model: bge-m3 (default, multilingual Thai↔EN, 1024-dim), nomic (fast, 768-dim), or qwen3 (cross-language, 4096-dim)',
-      },
-      all_projects: {
-        type: 'boolean',
-        description: 'Search across all oracle projects (bypass project scope). Use for cross-oracle knowledge retrieval.',
-        default: false
       }
     },
     required: ['query']
@@ -73,9 +69,7 @@ export const searchToolDef = {
 
 /**
  * Sanitize FTS5 query to prevent parse errors.
- * Removes FTS5 operators, column-prefix syntax, and characters that cause
- * FTS5 syntax errors (dots, slashes — treated as separators by tokenizer
- * but rejected by query parser).
+ * Removes FTS5 special characters that cause syntax errors.
  */
 export function sanitizeFtsQuery(query: string): string {
   let sanitized = query
@@ -112,8 +106,7 @@ export function parseConceptsFromMetadata(concepts: unknown): string[] {
       const parsed = JSON.parse(concepts);
       return Array.isArray(parsed) ? parsed : [];
     } catch {
-      // Fallback: comma-separated string from LanceDB metadata (storage.ts joins with ',')
-      return concepts.split(',').map((s: string) => s.trim()).filter(Boolean);
+      return [];
     }
   }
   return [];
@@ -318,7 +311,7 @@ export function combineResults(
 
 export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): Promise<ToolResponse> {
   const startTime = Date.now();
-  const { query, type = 'all', limit = 5, offset = 0, mode = 'hybrid', project, cwd, model, all_projects } = input;
+  const { query, type = 'all', limit = 5, offset = 0, mode = 'hybrid', project, cwd, model } = input;
 
   if (!query || query.trim().length === 0) {
     throw new Error('Query cannot be empty');
@@ -326,13 +319,8 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
 
   const safeQuery = sanitizeFtsQuery(query);
 
-  // Auto-detect project from cwd if not explicitly specified.
-  // ORACLE_SEARCH_SCOPE=all or all_projects bypasses cwd auto-detection,
-  // but an explicit `project` param still scopes the search.
-  const scopeAll = ORACLE_SEARCH_SCOPE === 'all' || all_projects;
-  const resolvedProject = scopeAll
-    ? (project?.toLowerCase() ?? null)
-    : (project ?? detectProject(cwd))?.toLowerCase() ?? null;
+  // Auto-detect project from cwd if not explicitly specified
+  const resolvedProject = (project ?? detectProject(cwd))?.toLowerCase() ?? null;
 
   // Project filter: if project specified, include project + universal (NULL)
   // If no project, return ALL documents (no filter)
@@ -347,32 +335,26 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
   // Run FTS5 search (skip if vector-only mode)
   let ftsRawResults: any[] = [];
   if (mode !== 'vector') {
-    try {
-      if (type === 'all') {
-        const stmt = ctx.sqlite.prepare(`
-          SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
-          FROM oracle_fts f
-          JOIN oracle_documents d ON f.id = d.id
-          WHERE oracle_fts MATCH ? ${projectFilter}
-          ORDER BY rank
-          LIMIT ?
-        `);
-        ftsRawResults = stmt.all(safeQuery, ...projectParams, limit * 2);
-      } else {
-        const stmt = ctx.sqlite.prepare(`
-          SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
-          FROM oracle_fts f
-          JOIN oracle_documents d ON f.id = d.id
-          WHERE oracle_fts MATCH ? AND d.type = ? ${projectFilter}
-          ORDER BY rank
-          LIMIT ?
-        `);
-        ftsRawResults = stmt.all(safeQuery, type, ...projectParams, limit * 2);
-      }
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      console.error('[FTS5] Query error:', msg, '| query:', safeQuery);
-      warning = `FTS5 search error: ${msg}. Using vector results only.`;
+    if (type === 'all') {
+      const stmt = ctx.sqlite.prepare(`
+        SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
+        FROM oracle_fts f
+        JOIN oracle_documents d ON f.id = d.id
+        WHERE oracle_fts MATCH ? ${projectFilter}
+        ORDER BY rank
+        LIMIT ?
+      `);
+      ftsRawResults = stmt.all(safeQuery, ...projectParams, limit * 2);
+    } else {
+      const stmt = ctx.sqlite.prepare(`
+        SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
+        FROM oracle_fts f
+        JOIN oracle_documents d ON f.id = d.id
+        WHERE oracle_fts MATCH ? AND d.type = ? ${projectFilter}
+        ORDER BY rank
+        LIMIT ?
+      `);
+      ftsRawResults = stmt.all(safeQuery, type, ...projectParams, limit * 2);
     }
   }
 
@@ -411,8 +393,52 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
   }));
 
   const combinedResults = combineResults(ftsResults, normalizedVectorResults);
-  const totalMatches = combinedResults.length;
-  const results = combinedResults.slice(offset, offset + limit);
+
+  // Reranker pass — cross-encoder over the top of the hybrid list.
+  // No-op when ORACLE_RERANKER_URL is unset (the helper pass-throughs).
+  // Empirical lift: +14.3 pts R@1 on cross-language Thai/EN smoke test.
+  const RERANK_POOL_SIZE = 50;
+  const rerankHead = combinedResults.slice(0, RERANK_POOL_SIZE);
+  const rerankTail = combinedResults.slice(RERANK_POOL_SIZE);
+  const reranked = await rerankCandidates({
+    query,
+    candidates: rerankHead,
+    getText: (r) => r.content,
+  });
+  const finalResults = reranked.reranked
+    ? [...reranked.results, ...rerankTail]
+    : combinedResults;
+
+  const totalMatches = finalResults.length;
+  const results: Array<Record<string, unknown>> = finalResults.slice(offset, offset + limit);
+
+  // Enrich with supersede flags (P-001 "Nothing is Deleted" — superseded docs
+  // remain searchable; callers need to see the flag to decide whether to
+  // follow the replacement pointer). Fixes drift where arra_supersede claimed
+  // "will appear in searches with a warning" but search never flagged them.
+  if (results.length > 0) {
+    const ids = results.map(r => r.id as string);
+    const placeholders = ids.map(() => '?').join(',');
+    const supersedeRows = ctx.sqlite.prepare(`
+      SELECT id, superseded_by, superseded_at, superseded_reason
+      FROM oracle_documents
+      WHERE id IN (${placeholders}) AND superseded_by IS NOT NULL
+    `).all(...ids) as Array<{
+      id: string;
+      superseded_by: string;
+      superseded_at: number;
+      superseded_reason: string | null;
+    }>;
+    const supersedeMap = new Map(supersedeRows.map(r => [r.id, r]));
+    for (const r of results) {
+      const s = supersedeMap.get(r.id as string);
+      if (s) {
+        r.superseded_by = s.superseded_by;
+        r.superseded_at = new Date(s.superseded_at).toISOString();
+        r.superseded_reason = s.superseded_reason;
+      }
+    }
+  }
 
   const ftsCount = results.filter((r) => r.source === 'fts').length;
   const vectorCount = results.filter((r) => r.source === 'vector').length;
@@ -428,6 +454,8 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     vectorMatches: number;
     sources: { fts: number; vector: number; hybrid: number };
     searchTime: number;
+    reranked?: boolean;
+    rerankFallbackReason?: string;
     warning?: string;
   } = {
     mode,
@@ -438,6 +466,8 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     vectorMatches: vecResults.length,
     sources: { fts: ftsCount, vector: vectorCount, hybrid: hybridCount },
     searchTime,
+    reranked: reranked.reranked,
+    ...(reranked.fallbackReason ? { rerankFallbackReason: reranked.fallbackReason } : {}),
   };
 
   if (warning) {
@@ -447,7 +477,7 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
   console.error(`[MCP:SEARCH] "${query}" (${type}, ${mode}, model=${model || 'default'}) → ${results.length} results in ${searchTime}ms`);
 
   try {
-    logSearch(query, type, mode, results.length, searchTime, results);
+    logSearch(query, type, mode, results.length, searchTime, results as unknown as SearchResult[]);
   } catch (e) {
     console.error('[MCP:SEARCH] Failed to log search to database:', e);
   }

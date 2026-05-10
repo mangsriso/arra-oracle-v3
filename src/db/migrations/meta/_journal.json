@@ -50,6 +50,76 @@
       "when": 1772415363037,
       "tag": "0006_magenta_screwball",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1776574727337,
+      "tag": "0007_add_menu_items",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1777248000000,
+      "tag": "0008_menu_host",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1777852800000,
+      "tag": "0009_menu_hidden",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1778457600000,
+      "tag": "0010_menu_query",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1778803200000,
+      "tag": "0011_menu_reorg",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1779321600000,
+      "tag": "0012_menu_studio",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1780000000000,
+      "tag": "0013_forum_subdomain",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1780012800000,
+      "tag": "0014_menu_path_studio_composite",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1780099200000,
+      "tag": "0015_menu_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1746460800000,
+      "tag": "0016_indexing_jobs",
+      "breakpoints": true
     }
   ]
 }

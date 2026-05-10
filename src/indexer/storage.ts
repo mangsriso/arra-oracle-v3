@@ -22,10 +22,16 @@ export async function storeDocuments(
 ): Promise<void> {
   const now = Date.now();
 
-  // Prepare FTS statements (raw SQL required for FTS5)
-  // FTS5 doesn't support REPLACE — must DELETE then INSERT to avoid duplicates
-  const deleteFts = sqlite.prepare('DELETE FROM oracle_fts WHERE id = ?');
-  const insertFts = sqlite.prepare('INSERT INTO oracle_fts (id, content, concepts) VALUES (?, ?, ?)');
+  // Prepare FTS statements. FTS5 virtual tables have no UNIQUE constraint on
+  // the id column (it's UNINDEXED), so INSERT OR REPLACE doesn't dedupe —
+  // every reindex accumulates duplicates. Delete-then-insert instead.
+  // (Drift discovered 2026-04-16: oracle_fts had 1268 rows for 141 unique ids
+  // after 9 reindex passes.)
+  const deleteFts = sqlite.prepare(`DELETE FROM oracle_fts WHERE id = ?`);
+  const insertFts = sqlite.prepare(`
+    INSERT INTO oracle_fts (id, content, concepts)
+    VALUES (?, ?, ?)
+  `);
 
   // Prepare for vector store
   const ids: string[] = [];
@@ -65,7 +71,8 @@ export async function storeDocuments(
         })
         .run();
 
-      // SQLite FTS — delete first to prevent duplicates (FTS5 has no REPLACE)
+      // SQLite FTS (raw SQL required for FTS5): delete then insert to avoid
+      // duplicates across re-index runs.
       deleteFts.run(doc.id);
       insertFts.run(
         doc.id,
@@ -79,8 +86,7 @@ export async function storeDocuments(
       metadatas.push({
         type: doc.type,
         source_file: doc.source_file,
-        concepts: doc.concepts.join(','),
-        project: docProject ?? ''
+        concepts: doc.concepts.join(',')
       });
     }
     sqlite.exec('COMMIT');

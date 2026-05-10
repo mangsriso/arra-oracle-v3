@@ -27,10 +27,19 @@ export const PORT = parseInt(String(process.env.ORACLE_PORT || C.ORACLE_DEFAULT_
 export const ORACLE_DATA_DIR = process.env.ORACLE_DATA_DIR || path.join(HOME_DIR, C.ORACLE_DATA_DIR_NAME);
 export const DB_PATH = process.env.ORACLE_DB_PATH || path.join(ORACLE_DATA_DIR, C.ORACLE_DB_FILE);
 
-// REPO_ROOT: where ψ/ lives
-// From source: project root. Via bunx: set ORACLE_REPO_ROOT. Fallback: data dir.
+// REPO_ROOT: where ψ/ lives.
+// Priority:
+//   1. ORACLE_REPO_ROOT env var — explicit override
+//   2. ORACLE_DATA_DIR if it has ψ/ — canonical data location (outside code repo)
+//   3. PROJECT_ROOT if it has ψ/ — dev mode for indexing the oracle's own psi
+//   4. ORACLE_DATA_DIR — default (will be empty initially)
+//
+// Data dir wins over project root so that accidental ψ/ folders in a source
+// checkout (e.g. from arra_learn writing with no vault configured) don't
+// override the real indexed data at ~/.arra-oracle-v2/ψ/.
 export const REPO_ROOT = process.env.ORACLE_REPO_ROOT ||
-  (fs.existsSync(path.join(PROJECT_ROOT, 'ψ')) ? PROJECT_ROOT : ORACLE_DATA_DIR);
+  (fs.existsSync(path.join(ORACLE_DATA_DIR, '\u03c8')) ? ORACLE_DATA_DIR :
+   fs.existsSync(path.join(PROJECT_ROOT, '\u03c8')) ? PROJECT_ROOT : ORACLE_DATA_DIR);
 
 // Search scope: 'all' = universal (no cwd auto-scoping), 'project' = legacy (cwd auto-detect)
 export const ORACLE_SEARCH_SCOPE = process.env.ORACLE_SEARCH_SCOPE || 'project';
@@ -51,3 +60,11 @@ export const CHROMADB_DIR = path.join(HOME_DIR, C.CHROMADB_DIR_NAME);
 if (!fs.existsSync(ORACLE_DATA_DIR)) {
   fs.mkdirSync(ORACLE_DATA_DIR, { recursive: true });
 }
+
+// Vector layer routing (#1071 phase 1.2)
+//   VECTOR_URL       — if set, vector calls proxy to this base URL (e.g. http://vector.local:8080)
+//                      if empty, the local vector adapter is used (backward compat).
+//   VECTOR_FALLBACK  — what to do when proxy is unreachable. 'fts5' = serve FTS5-only
+//                      results with vectorAvailable: false. (Future: 'cache', 'fail'.)
+export const VECTOR_URL = process.env.VECTOR_URL || '';
+export const VECTOR_FALLBACK = process.env.VECTOR_FALLBACK || 'fts5';

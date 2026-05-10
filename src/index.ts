@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 /**
  * Arra Oracle MCP Server
  *
@@ -15,12 +16,12 @@ import { type BunSQLiteDatabase } from 'drizzle-orm/bun-sqlite';
 import { Database } from 'bun:sqlite';
 import * as schema from './db/schema.ts';
 import { createDatabase } from './db/index.ts';
-import { getVectorStoreByModel } from './vector/factory.ts';
+import { createVectorStore } from './vector/factory.ts';
 import type { VectorStoreAdapter } from './vector/types.ts';
 import path from 'path';
 import fs from 'fs';
 import { loadToolGroupConfig, getDisabledTools, type ToolGroupConfig } from './config/tool-groups.ts';
-import { ORACLE_DATA_DIR, DB_PATH } from './config.ts';
+import { ORACLE_DATA_DIR, DB_PATH, REPO_ROOT } from './config.ts';
 import { MCP_SERVER_NAME } from './const.ts';
 
 // Tool handlers (all extracted to src/tools/)
@@ -79,7 +80,7 @@ class OracleMCPServer {
   private db: BunSQLiteDatabase<typeof schema>;
   private repoRoot: string;
   private vectorStore: VectorStoreAdapter;
-  private vectorStatus: 'unknown' | 'connected' | 'empty' | 'unavailable' = 'unknown';
+  private vectorStatus: 'unknown' | 'connected' | 'unavailable' = 'unknown';
   private readOnly: boolean;
   private version: string;
   private disabledTools: Set<string>;
@@ -89,7 +90,10 @@ class OracleMCPServer {
     if (this.readOnly) {
       console.error('[Oracle] Running in READ-ONLY mode');
     }
-    this.repoRoot = process.env.ORACLE_REPO_ROOT || process.cwd();
+    // Use safe REPO_ROOT from config.ts: never falls back to process.cwd(),
+    // which would create parasitic ψ/ dirs in whatever directory the MCP
+    // server was launched from. See #551.
+    this.repoRoot = REPO_ROOT;
 
     const groupConfig = options.toolGroups ?? loadToolGroupConfig(this.repoRoot);
     this.disabledTools = getDisabledTools(groupConfig);
@@ -98,7 +102,12 @@ class OracleMCPServer {
       console.error(`[ToolGroups] Disabled: ${disabledGroups.join(', ')}`);
     }
 
-    this.vectorStore = getVectorStoreByModel('bge-m3');
+    this.vectorStore = createVectorStore({
+      type: 'lancedb',
+      collectionName: 'oracle_knowledge_bge_m3',
+      embeddingProvider: 'ollama',
+      embeddingModel: 'bge-m3',
+    });
 
     const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname || __dirname, '..', 'package.json'), 'utf-8'));
     this.version = pkg.version;
@@ -113,6 +122,7 @@ class OracleMCPServer {
 
     this.setupHandlers();
     this.setupErrorHandling();
+    this.verifyVectorHealth();
   }
 
   /** Build ToolContext from server state */
@@ -134,8 +144,8 @@ class OracleMCPServer {
         this.vectorStatus = 'connected';
         console.error(`[VectorDB:${this.vectorStore.name}] ✓ oracle_knowledge: ${stats.count} documents`);
       } else {
-        this.vectorStatus = 'empty';
-        console.error(`[VectorDB:${this.vectorStore.name}] ⚠ Connected but collection empty (0 documents — run indexer)`);
+        this.vectorStatus = 'connected';
+        console.error(`[VectorDB:${this.vectorStore.name}] ✓ Connected but collection empty`);
       }
     } catch (e) {
       this.vectorStatus = 'unavailable';
@@ -284,7 +294,6 @@ class OracleMCPServer {
 
   async preConnectVector(): Promise<void> {
     await this.vectorStore.connect();
-    await this.verifyVectorHealth();
   }
 
   async run(): Promise<void> {
