@@ -116,6 +116,9 @@ export const forumToolDefs = [
 // ============================================================================
 
 export async function handleThread(input: OracleThreadInput): Promise<ToolResponse> {
+  if (!input.message || input.message.trim().length === 0) {
+    throw new Error('message cannot be empty');
+  }
   const result = await handleThreadMessage({
     message: input.message,
     threadId: input.threadId,

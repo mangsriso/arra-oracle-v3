@@ -40,6 +40,9 @@ import {
   handleThread, handleThreads, handleThreadRead, handleThreadUpdate,
   traceToolDefs,
   handleTrace, handleTraceList, handleTraceGet, handleTraceLink, handleTraceUnlink, handleTraceChain,
+  reflectToolDef, handleReflect,
+  verifyToolDef, handleVerify,
+  scheduleAddToolDef, scheduleListToolDef, handleScheduleAdd, handleScheduleList,
 } from './tools/index.ts';
 
 import type {
@@ -56,6 +59,10 @@ import type {
   OracleThreadsInput,
   OracleThreadReadInput,
   OracleThreadUpdateInput,
+  OracleReflectInput,
+  OracleVerifyInput,
+  OracleScheduleAddInput,
+  OracleScheduleListInput,
 } from './tools/index.ts';
 
 import type {
@@ -72,6 +79,7 @@ const WRITE_TOOLS = [
   'arra_trace',
   'arra_supersede',
   'arra_handoff',
+  'arra_schedule_add',
 ];
 
 class OracleMCPServer {
@@ -192,10 +200,15 @@ class OracleMCPServer {
         ...forumToolDefs,
         // Trace tools (from src/tools/trace.ts)
         ...traceToolDefs,
-        // Supersede, Handoff, Inbox, Verify
+        // Supersede, Handoff, Inbox
         supersedeToolDef,
         handoffToolDef,
         inboxToolDef,
+        // Reflect, Verify, Schedule
+        reflectToolDef,
+        verifyToolDef,
+        scheduleAddToolDef,
+        scheduleListToolDef,
       ];
 
       let tools = allTools.filter(t => !this.disabledTools.has(t.name));
@@ -235,6 +248,10 @@ class OracleMCPServer {
       try {
         switch (request.params.name) {
           // Core tools (delegated to src/tools/)
+          case '____IMPORTANT':
+            return {
+              content: [{ type: 'text', text: this.version ? `ORACLE WORKFLOW GUIDE (v${this.version})` : 'Oracle MCP Server' }],
+            };
           case 'arra_search':
             return await handleSearch(ctx, request.params.arguments as unknown as OracleSearchInput);
           case 'arra_read':
@@ -276,6 +293,16 @@ class OracleMCPServer {
             return await handleTraceUnlink(request.params.arguments as unknown as { traceId: string; direction: 'prev' | 'next' });
           case 'arra_trace_chain':
             return await handleTraceChain(request.params.arguments as unknown as { traceId: string });
+
+          // Reflect, Verify, Schedule tools
+          case 'arra_reflect':
+            return await handleReflect(ctx, request.params.arguments as unknown as OracleReflectInput);
+          case 'arra_verify':
+            return await handleVerify(ctx, request.params.arguments as unknown as OracleVerifyInput);
+          case 'arra_schedule_add':
+            return await handleScheduleAdd(ctx, request.params.arguments as unknown as OracleScheduleAddInput);
+          case 'arra_schedule_list':
+            return await handleScheduleList(ctx, request.params.arguments as unknown as OracleScheduleListInput);
 
           default:
             throw new Error(`Unknown tool: ${request.params.name}`);

@@ -185,6 +185,12 @@ export const scheduleListToolDef = {
 // ============================================================================
 
 export async function handleScheduleAdd(ctx: ToolContext, input: OracleScheduleAddInput): Promise<ToolResponse> {
+  if (!input.date || input.date.trim().length === 0) {
+    throw new Error('date cannot be empty');
+  }
+  if (!input.event || input.event.trim().length === 0) {
+    throw new Error('event cannot be empty');
+  }
   const { event, time, notes } = input;
   const dateCanonical = parseDate(input.date);
   const now = Date.now();

@@ -98,7 +98,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return await fetchJson('/mcp/call', {
       name: request.params.name,
       arguments: request.params.arguments ?? {},
-      repoRoot: process.cwd(),
+      repoRoot: '',
     }) as ToolResponse;
   } catch (error) {
     resetHealthChecked();

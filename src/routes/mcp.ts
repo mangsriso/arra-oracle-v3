@@ -16,6 +16,10 @@ import type {
   OracleThreadsInput,
   OracleThreadReadInput,
   OracleThreadUpdateInput,
+  OracleReflectInput,
+  OracleVerifyInput,
+  OracleScheduleAddInput,
+  OracleScheduleListInput,
   CreateTraceInput,
   ListTracesInput,
   GetTraceInput,
@@ -51,6 +55,14 @@ import {
   handleTraceLink,
   handleTraceUnlink,
   handleTraceChain,
+  reflectToolDef,
+  handleReflect,
+  verifyToolDef,
+  handleVerify,
+  scheduleAddToolDef,
+  scheduleListToolDef,
+  handleScheduleAdd,
+  handleScheduleList,
 } from '../tools/index.ts';
 
 interface McpListToolsRequest {
@@ -85,6 +97,10 @@ function buildToolList(version: string) {
     supersedeToolDef,
     handoffToolDef,
     inboxToolDef,
+    reflectToolDef,
+    verifyToolDef,
+    scheduleAddToolDef,
+    scheduleListToolDef,
   ];
 }
 
@@ -106,6 +122,7 @@ const WRITE_TOOLS = [
   'arra_trace',
   'arra_supersede',
   'arra_handoff',
+  'arra_schedule_add',
 ];
 
 function getRepoRoot(override: unknown, fallback: string): string {
@@ -149,6 +166,8 @@ export function registerMcpRoutes(app: Hono, ctx: ToolContext) {
       switch (body.name) {
         case 'arra_search':
           return c.json(await handleSearch(callCtx, body.arguments as OracleSearchInput));
+        case '____IMPORTANT':
+          return c.json({ content: [{ type: 'text', text: buildImportantTool(ctx.version).description }] });
         case 'arra_read':
           return c.json(await handleRead(callCtx, body.arguments as OracleReadInput));
         case 'arra_learn':
@@ -185,6 +204,14 @@ export function registerMcpRoutes(app: Hono, ctx: ToolContext) {
           return c.json(await handleTraceUnlink(body.arguments as { traceId: string; direction: 'prev' | 'next' }));
         case 'arra_trace_chain':
           return c.json(await handleTraceChain(body.arguments as { traceId: string }));
+        case 'arra_reflect':
+          return c.json(await handleReflect(callCtx, body.arguments as OracleReflectInput));
+        case 'arra_verify':
+          return c.json(await handleVerify(callCtx, body.arguments as OracleVerifyInput));
+        case 'arra_schedule_add':
+          return c.json(await handleScheduleAdd(callCtx, body.arguments as OracleScheduleAddInput));
+        case 'arra_schedule_list':
+          return c.json(await handleScheduleList(callCtx, body.arguments as OracleScheduleListInput));
         default:
           return c.json(errorResponse(`Unknown tool: ${body.name}`));
       }

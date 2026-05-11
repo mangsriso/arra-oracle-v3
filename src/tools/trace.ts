@@ -132,6 +132,9 @@ export const traceToolDefs = [
 // ============================================================================
 
 export async function handleTrace(input: CreateTraceInput): Promise<ToolResponse> {
+  if (!input.query || input.query.trim().length === 0) {
+    throw new Error('query cannot be empty');
+  }
   const result = createTrace(input);
   console.error(`[MCP:TRACE] query="${input.query}" depth=${result.depth} digPoints=${result.summary.totalDigPoints}`);
 

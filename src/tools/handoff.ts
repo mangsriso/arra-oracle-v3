@@ -32,6 +32,9 @@ export const handoffToolDef = {
 
 export async function handleHandoff(ctx: ToolContext, input: OracleHandoffInput): Promise<ToolResponse> {
   const { content, slug: slugInput } = input;
+  if (!content || content.trim().length === 0) {
+    throw new Error('content cannot be empty');
+  }
   const now = new Date();
 
   const dateStr = now.toISOString().split('T')[0];

@@ -16,6 +16,10 @@ export type {
   OracleHandoffInput,
   OracleInboxInput,
   OracleReadInput,
+  OracleReflectInput,
+  OracleVerifyInput,
+  OracleScheduleAddInput,
+  OracleScheduleListInput,
 } from './types.ts';
 export type {
   CreateTraceInput,
@@ -88,3 +92,12 @@ export {
   handleTraceUnlink,
   handleTraceChain,
 } from './trace.ts';
+
+// Reflect
+export { reflectToolDef, handleReflect } from './reflect.ts';
+
+// Verify
+export { verifyToolDef, handleVerify } from './verify.ts';
+
+// Schedule
+export { scheduleAddToolDef, scheduleListToolDef, handleScheduleAdd, handleScheduleList } from './schedule.ts';

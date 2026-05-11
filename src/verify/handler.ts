@@ -67,14 +67,55 @@ export function verifyKnowledgeBase(opts: {
   const { check = true, type, repoRoot } = opts;
 
   // 1. Walk indexed directories on disk
+  //    - vault-relative: ψ/memory/* (direct vault files)
+  //    - project-prefixed: github.com/*/ψ/memory/* (cross-project files from indexer)
   const indexedDirs = ['ψ/memory/resonance', 'ψ/memory/learnings', 'ψ/memory/retrospectives'];
   const diskFiles = new Map<string, number>(); // relativePath -> mtimeMs
 
+  // Walk vault-relative paths
   for (const dir of indexedDirs) {
     const fullDir = path.join(repoRoot, dir);
     const files = walkMarkdownFiles(fullDir, repoRoot);
     for (const f of files) {
       diskFiles.set(f.relativePath, f.mtimeMs);
+    }
+  }
+
+  // Walk project-prefixed paths: github.com/*/ψ/memory/*
+  const ghDir = path.join(repoRoot, 'github.com');
+  if (fs.existsSync(ghDir)) {
+    const orgs = fs.readdirSync(ghDir);
+    for (const org of orgs) {
+      const orgDir = path.join(ghDir, org);
+      if (!fs.statSync(orgDir).isDirectory()) continue;
+      const repos = fs.readdirSync(orgDir);
+      for (const repo of repos) {
+        const repoDir = path.join(orgDir, repo);
+        if (!fs.statSync(repoDir).isDirectory()) continue;
+        for (const subDir of ['ψ/memory/resonance', 'ψ/memory/learnings', 'ψ/memory/retrospectives']) {
+          const fullDir = path.join(repoDir, subDir);
+          if (fs.existsSync(fullDir)) {
+            const files = walkMarkdownFiles(fullDir, repoRoot);
+            for (const f of files) {
+              diskFiles.set(f.relativePath, f.mtimeMs);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Walk universal paths: _universal/ψ/memory/*
+  const universalDir = path.join(repoRoot, '_universal');
+  if (fs.existsSync(universalDir)) {
+    for (const subDir of ['ψ/memory/resonance', 'ψ/memory/learnings', 'ψ/memory/retrospectives']) {
+      const fullDir = path.join(universalDir, subDir);
+      if (fs.existsSync(fullDir)) {
+        const files = walkMarkdownFiles(fullDir, repoRoot);
+        for (const f of files) {
+          diskFiles.set(f.relativePath, f.mtimeMs);
+        }
+      }
     }
   }
 
