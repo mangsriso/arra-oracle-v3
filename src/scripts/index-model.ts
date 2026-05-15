@@ -42,8 +42,8 @@ async function main() {
   const store = createVectorStore({
     type: 'lancedb',
     collectionName: preset.collection,
-    embeddingProvider: 'ollama',
-    embeddingModel: preset.model,
+    embeddingProvider: (process.env.ORACLE_EMBEDDING_PROVIDER as any) || 'ollama',
+    embeddingModel: process.env.ORACLE_EMBEDDING_MODEL || preset.model,
     ...(preset.dataPath && { dataPath: preset.dataPath }),
   });
 
