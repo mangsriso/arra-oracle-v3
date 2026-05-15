@@ -123,7 +123,7 @@ export async function handleThread(input: OracleThreadInput): Promise<ToolRespon
     message: input.message,
     threadId: input.threadId,
     title: input.title,
-    role: input.role || 'claude',
+    role: input.role || 'human',
     model: input.model,
   });
 
