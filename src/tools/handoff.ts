@@ -38,7 +38,10 @@ export async function handleHandoff(ctx: ToolContext, input: OracleHandoffInput)
   const now = new Date();
 
   const dateStr = now.toISOString().split('T')[0];
-  const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}`;
+  // Bug 3 fix: minute-precision timeStr caused overwrites when arra_handoff
+  // was called multiple times in the same minute with the same/empty slug.
+  // Include seconds + ms to avoid collisions while keeping the filename readable.
+  const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
 
   const slug = slugInput || content
     .substring(0, 50)
@@ -48,7 +51,7 @@ export async function handleHandoff(ctx: ToolContext, input: OracleHandoffInput)
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '') || 'handoff';
 
-  const filename = `${dateStr}_${timeStr}_${slug}.md`;
+  let filename = `${dateStr}_${timeStr}_${slug}.md`;
 
   // Resolve vault root for central writes
   const vault = getVaultPsiRoot();
@@ -68,6 +71,20 @@ export async function handleHandoff(ctx: ToolContext, input: OracleHandoffInput)
   }
 
   fs.mkdirSync(dirPath, { recursive: true });
+
+  // Bug 3 fix: defensive collision check — if a file with this name already
+  // exists (e.g., two calls within the same second with identical slug),
+  // append an incrementing counter to preserve both handoffs.
+  if (fs.existsSync(path.join(dirPath, filename))) {
+    const base = filename.replace(/\.md$/, '');
+    let counter = 2;
+    while (fs.existsSync(path.join(dirPath, `${base}-${counter}.md`))) {
+      counter++;
+    }
+    filename = `${base}-${counter}.md`;
+    sourceFileRel = sourceFileRel.replace(/[^/]+\.md$/, filename);
+  }
+
   fs.writeFileSync(path.join(dirPath, filename), content, 'utf-8');
 
   console.error(`[MCP:HANDOFF] Written: ${sourceFileRel}`);
