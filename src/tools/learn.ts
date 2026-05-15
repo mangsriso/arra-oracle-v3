@@ -109,13 +109,20 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
 
-  const slug = pattern
+  let slug = pattern
     .substring(0, 50)
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, '')
     .replace(/\s+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
+
+  // Bug 1 fix: empty slug (e.g. Thai/Unicode-only pattern strips to '') causes
+  // filename collisions across distinct patterns. Fall back to a millisecond
+  // timestamp to guarantee uniqueness while preserving the date prefix.
+  if (!slug) {
+    slug = `pattern-${now.getTime()}`;
+  }
 
   const filename = `${dateStr}_${slug}.md`;
 
