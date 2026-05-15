@@ -118,10 +118,19 @@ export const mcpRoutes = new Elysia()
     set.status = 200;
     return errorResponse(error instanceof Error ? error.message : String(error));
   })
-  .post('/mcp/tools', async ({ body }) => {
+  // CrossCheck-fix: Elysia parent app auto-parses JSON body and emits PARSE
+  // error at parent level BEFORE sub-app .onError fires. To guarantee MCP-shape
+  // on ALL inputs (including malformed JSON), we bypass auto-parse via
+  // `body: t.Unknown()` + raw `request.text()` + manual JSON.parse in try/catch.
+  .post('/mcp/tools', async ({ request }) => {
     // R3-fix: metadata-only endpoint — do NOT await vectorReady (parity).
     try {
-      const req = (body ?? {}) as { repoRoot?: string };
+      const raw = await request.text();
+      let req: { repoRoot?: string } = {};
+      if (raw && raw.trim()) {
+        try { req = JSON.parse(raw); }
+        catch { return errorResponse('Invalid JSON body'); }
+      }
       const repoRoot = getRepoRoot(req.repoRoot, REPO_ROOT);
       const disabledTools = getDisabledTools(loadToolGroupConfig(repoRoot));
       let tools = buildToolList(pkg.version).filter((t) => !disabledTools.has(t.name));
@@ -132,11 +141,16 @@ export const mcpRoutes = new Elysia()
     } catch (error) {
       return errorResponse(error instanceof Error ? error.message : String(error));
     }
-  })
-  .post('/mcp/call', async ({ body }) => {
+  }, { parse: 'none' })
+  .post('/mcp/call', async ({ request }) => {
     try {
       await vectorReady;
-      const req = (body ?? {}) as { name?: string; arguments?: unknown; repoRoot?: string };
+      const raw = await request.text();
+      let req: { name?: string; arguments?: unknown; repoRoot?: string } = {};
+      if (raw && raw.trim()) {
+        try { req = JSON.parse(raw); }
+        catch { return errorResponse('Invalid JSON body'); }
+      }
       if (!req.name || typeof req.name !== 'string') {
         return errorResponse('Missing tool name');
       }
@@ -181,4 +195,4 @@ export const mcpRoutes = new Elysia()
     } catch (error) {
       return errorResponse(error instanceof Error ? error.message : String(error));
     }
-  });
+  }, { parse: 'none' });
