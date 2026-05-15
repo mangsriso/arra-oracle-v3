@@ -43,6 +43,7 @@ import { sessionsRoutes } from './routes/sessions/index.ts';
 import { vaultRoutes } from './routes/vault/index.ts';
 import { indexerRoutes } from './routes/indexer/index.ts';
 import { createMenuRoutes } from './routes/menu/index.ts';
+import { mcpRoutes } from './routes/mcp/index.ts';
 import { gatewayPlugin } from './gateway/index.ts';
 
 import pkg from '../package.json' with { type: 'json' };
@@ -208,6 +209,7 @@ const apiModules = [
   sessionsRoutes,
   vaultRoutes,
   indexerRoutes,
+  mcpRoutes,
 ];
 
 try {
