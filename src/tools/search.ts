@@ -10,6 +10,7 @@ import { logSearch } from '../server/logging.ts';
 import { detectProject } from '../server/project-detect.ts';
 import { rerankCandidates } from '../server/reranker.ts';
 import { ensureVectorStoreConnected } from '../vector/factory.ts';
+import { DISABLE_LOCAL_VECTOR } from '../config.ts';
 import type { SearchResult } from '../server/types.ts';
 import type { ToolContext, ToolResponse, OracleSearchInput } from './types.ts';
 
@@ -364,9 +365,17 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     }
   }
 
-  // Run vector search (skip if fts-only mode)
+  // Run vector search (skip if fts-only mode OR if local vector is disabled
+  // by env. ORACLE_DISABLE_LOCAL_VECTOR=true bypasses the in-process LanceDB
+  // call because the host CPU lacks AVX2 — LanceDB ≥0.27 emits AVX2 SIMD
+  // inside query() and crashes Bun with SIGILL on AVX-only CPUs. The crash
+  // is at the C-binding level, so a try/catch cannot rescue it; the only
+  // safe option is to skip the call entirely.)
   let vecResults: Awaited<ReturnType<typeof vectorSearch>> = [];
-  if (mode !== 'fts') {
+  if (mode !== 'fts' && DISABLE_LOCAL_VECTOR) {
+    vectorSearchError = true;
+    warning = 'Local vector adapter disabled (ORACLE_DISABLE_LOCAL_VECTOR). Returning FTS5 results.';
+  } else if (mode !== 'fts') {
     try {
       vecResults = await vectorSearch(ctx, query, type, limit * 2, model);
     } catch (error) {

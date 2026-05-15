@@ -9,7 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { eq, sql, or, inArray } from 'drizzle-orm';
 import { db, sqlite, oracleDocuments, indexingStatus, isDbLockError } from '../db/index.ts';
-import { REPO_ROOT, VECTOR_URL } from '../config.ts';
+import { REPO_ROOT, VECTOR_URL, DISABLE_LOCAL_VECTOR } from '../config.ts';
 import { logSearch, logDocumentAccess, logLearning } from './logging.ts';
 import type { SearchResult, SearchResponse } from './types.ts';
 import { ensureVectorStoreConnected, EMBEDDING_MODELS } from '../vector/factory.ts';
@@ -150,6 +150,12 @@ export async function handleSearch(
       vectorAvailable = false;
       warning = 'Vector proxy unavailable — FTS5-only results';
     }
+  } else if (mode !== 'fts' && DISABLE_LOCAL_VECTOR) {
+    // Local LanceDB adapter is disabled (host CPU lacks AVX2; LanceDB ≥0.27
+    // emits AVX2 SIMD inside query() and crashes Bun with SIGILL). Skip the
+    // vector leg entirely — return FTS5 results with vectorAvailable=false.
+    vectorAvailable = false;
+    warning = 'Local vector adapter disabled (ORACLE_DISABLE_LOCAL_VECTOR) — FTS5-only results';
   } else if (mode !== 'fts') {
     // Determine which models to query
     const isMulti = model === 'multi';

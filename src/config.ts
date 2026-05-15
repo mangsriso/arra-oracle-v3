@@ -68,3 +68,14 @@ if (!fs.existsSync(ORACLE_DATA_DIR)) {
 //                      results with vectorAvailable: false. (Future: 'cache', 'fail'.)
 export const VECTOR_URL = process.env.VECTOR_URL || '';
 export const VECTOR_FALLBACK = process.env.VECTOR_FALLBACK || 'fts5';
+
+// Per-CPU vector escape hatch.
+//   ORACLE_DISABLE_LOCAL_VECTOR=true — skip the local LanceDB vector path
+//     entirely. Use when the host CPU lacks AVX2 (LanceDB native bindings
+//     ≥0.27.x emit AVX2 SIMD inside query(), which crashes Bun with SIGILL
+//     "Illegal instruction" on AVX-only CPUs). When set, hybrid/vector mode
+//     searches return FTS5-only results with vectorAvailable=false.
+//   Default off — preserves existing behavior on AVX2-capable hosts.
+//   Works in conjunction with VECTOR_URL: if both are set, proxy still
+//     takes precedence; this only neutralises the in-process fallback.
+export const DISABLE_LOCAL_VECTOR = process.env.ORACLE_DISABLE_LOCAL_VECTOR === 'true';
