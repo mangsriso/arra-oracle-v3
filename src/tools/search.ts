@@ -102,11 +102,17 @@ export function parseConceptsFromMetadata(concepts: unknown): string[] {
   if (!concepts) return [];
   if (Array.isArray(concepts)) return concepts;
   if (typeof concepts === 'string') {
+    if (concepts.length === 0) return [];
     try {
       const parsed = JSON.parse(concepts);
       return Array.isArray(parsed) ? parsed : [];
     } catch {
-      return [];
+      // LanceDB stores concepts as comma-separated strings (not JSON arrays).
+      // Preserve the raw string content: split on comma if present, else wrap.
+      if (concepts.includes(',')) {
+        return concepts.split(',').map(s => s.trim()).filter(Boolean);
+      }
+      return [concepts];
     }
   }
   return [];
