@@ -5,7 +5,7 @@
 import { Elysia } from 'elysia';
 import { handleSimilar } from '../../server/vector-handlers.ts';
 import { createVectorProxy } from '../../server/vector-proxy.ts';
-import { VECTOR_URL } from '../../config.ts';
+import { VECTOR_URL, DISABLE_LOCAL_VECTOR } from '../../config.ts';
 import { SimilarQuery } from './model.ts';
 
 const proxy = createVectorProxy(VECTOR_URL);
@@ -27,6 +27,19 @@ export const similarEndpoint = new Elysia().get(
       if (remote) return remote;
       set.status = 503;
       return { error: 'Vector proxy unavailable', results: [], docId: id };
+    }
+
+    // Local LanceDB queryById() also uses AVX2 SIMD → would SIGILL on
+    // AVX-only hosts. Return empty results with explicit warning rather
+    // than crashing the server. See ORACLE_DISABLE_LOCAL_VECTOR in config.ts.
+    if (DISABLE_LOCAL_VECTOR) {
+      set.status = 503;
+      return {
+        error: 'Local vector adapter disabled (ORACLE_DISABLE_LOCAL_VECTOR)',
+        results: [],
+        docId: id,
+        vectorAvailable: false,
+      };
     }
 
     try {
