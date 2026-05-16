@@ -109,7 +109,10 @@ export class LanceDBAdapter implements VectorStoreAdapter {
 
     // Fetch extra results if filtering in JS (metadata is stored as string, not binary)
     const fetchLimit = where ? limit * 3 : limit;
-    const results = await this.table.search(queryEmbedding).distanceType('cosine').limit(fetchLimit).toArray();
+    // Use 'dot' instead of 'cosine': bge-m3 vectors are L2-normalized, so
+    // 1-dot_product == cosine_distance numerically. Avoids AVX2 SIGILL on
+    // AVX-only CPUs (LanceDB ≥0.27 emits AVX2 SIMD in the cosine path).
+    const results = await this.table.search(queryEmbedding).distanceType('dot').limit(fetchLimit).toArray();
 
     // Filter metadata in JavaScript (LanceDB json_extract requires LargeBinary, not Utf8)
     let filtered = results;
@@ -138,7 +141,8 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     }
 
     const vector = Array.from(rows[0].vector);
-    const results = await this.table.search(vector).distanceType('cosine').limit(nResults + 1).toArray();
+    // 'dot' == cosine_distance for L2-normalized vectors (bge-m3). Avoids AVX2 SIGILL.
+    const results = await this.table.search(vector).distanceType('dot').limit(nResults + 1).toArray();
 
     const filtered = results.filter((r: any) => r.id !== id).slice(0, nResults);
 
