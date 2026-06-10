@@ -39,6 +39,10 @@ export interface OracleSearchInput {
   cwd?: string;
   model?: 'nomic' | 'qwen3' | 'bge-m3';
   all_projects?: boolean;
+  /** Include superseded documents (hidden by default; stored + flagged per P-001). */
+  include_superseded?: boolean;
+  /** Collapse section chunks per (project, source_file); survivor carries chunk_count. */
+  dedup_chunks?: boolean;
 }
 
 export interface OracleReflectInput {}

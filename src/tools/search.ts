@@ -9,6 +9,7 @@
 import { logSearch } from '../server/logging.ts';
 import { detectProject } from '../server/project-detect.ts';
 import { rerankCandidates } from '../server/reranker.ts';
+import { annotateAndFilterSuperseded, dedupChunks } from '../server/search-quality.ts';
 import { ensureVectorStoreConnected } from '../vector/factory.ts';
 import { DISABLE_LOCAL_VECTOR } from '../config.ts';
 import type { SearchResult } from '../server/types.ts';
@@ -58,6 +59,16 @@ export const searchToolDef = {
         type: 'string',
         enum: ['nomic', 'qwen3', 'bge-m3'],
         description: 'Embedding model: bge-m3 (default, multilingual Thai↔EN, 1024-dim), nomic (fast, 768-dim), or qwen3 (cross-language, 4096-dim)',
+      },
+      include_superseded: {
+        type: 'boolean',
+        description: 'Include documents that have been superseded (hidden by default; they remain stored and flagged — Nothing is Deleted)',
+        default: false
+      },
+      dedup_chunks: {
+        type: 'boolean',
+        description: 'Collapse section chunks of the same source file to one result (survivor carries chunk_count). Set false for section-level granularity.',
+        default: true
       }
     },
     required: ['query']
@@ -318,7 +329,10 @@ export function combineResults(
 
 export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): Promise<ToolResponse> {
   const startTime = Date.now();
-  const { query, type = 'all', limit = 5, offset = 0, mode = 'hybrid', project, cwd, model } = input;
+  const {
+    query, type = 'all', limit = 5, offset = 0, mode = 'hybrid', project, cwd, model,
+    include_superseded = false, dedup_chunks = true,
+  } = input;
 
   if (!query || query.trim().length === 0) {
     throw new Error('Query cannot be empty');
@@ -409,20 +423,38 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
 
   const combinedResults = combineResults(ftsResults, normalizedVectorResults);
 
+  // Quality pass 1 (shared with HTTP path — src/server/search-quality.ts):
+  // annotate project (dedup key) + hide superseded docs unless opted in.
+  // Runs BEFORE rerank so the reranker pool isn't wasted on hidden docs.
+  const supersededPass = annotateAndFilterSuperseded(
+    ctx.sqlite,
+    combinedResults as Array<(typeof combinedResults)[number] & { project?: string | null; chunk_count?: number }>,
+    include_superseded,
+  );
+
   // Reranker pass — cross-encoder over the top of the hybrid list.
   // No-op when ORACLE_RERANKER_URL is unset (the helper pass-throughs).
   // Empirical lift: +14.3 pts R@1 on cross-language Thai/EN smoke test.
   const RERANK_POOL_SIZE = 50;
-  const rerankHead = combinedResults.slice(0, RERANK_POOL_SIZE);
-  const rerankTail = combinedResults.slice(RERANK_POOL_SIZE);
+  const rerankHead = supersededPass.results.slice(0, RERANK_POOL_SIZE);
+  const rerankTail = supersededPass.results.slice(RERANK_POOL_SIZE);
   const reranked = await rerankCandidates({
     query,
     candidates: rerankHead,
     getText: (r) => r.content,
   });
-  const finalResults = reranked.reranked
+  const rankedResults = reranked.reranked
     ? [...reranked.results, ...rerankTail]
-    : combinedResults;
+    : supersededPass.results;
+
+  // Quality pass 2: collapse section chunks per (project, source_file).
+  // AFTER rerank (positional survivor — no cross-boundary score comparison),
+  // BEFORE pagination slice (no duplicates across pages). May under-fill
+  // `limit` when many top hits collapse — expected, surfaced via metadata.
+  const dedupPass = dedup_chunks
+    ? dedupChunks(rankedResults)
+    : { results: rankedResults, removed: 0 };
+  const finalResults = dedupPass.results;
 
   const totalMatches = finalResults.length;
   const results: Array<Record<string, unknown>> = finalResults.slice(offset, offset + limit);
@@ -469,6 +501,8 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     vectorMatches: number;
     sources: { fts: number; vector: number; hybrid: number };
     searchTime: number;
+    superseded_hidden: number;
+    deduped_removed: number;
     reranked?: boolean;
     rerankFallbackReason?: string;
     warning?: string;
@@ -481,6 +515,9 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     vectorMatches: vecResults.length,
     sources: { fts: ftsCount, vector: vectorCount, hybrid: hybridCount },
     searchTime,
+    // Counts are scoped to THIS candidate pool, not corpus-wide.
+    superseded_hidden: supersededPass.hidden,
+    deduped_removed: dedupPass.removed,
     reranked: reranked.reranked,
     ...(reranked.fallbackReason ? { rerankFallbackReason: reranked.fallbackReason } : {}),
   };

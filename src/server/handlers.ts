@@ -14,6 +14,7 @@ import { logSearch, logDocumentAccess, logLearning } from './logging.ts';
 import type { SearchResult, SearchResponse } from './types.ts';
 import { ensureVectorStoreConnected, EMBEDDING_MODELS } from '../vector/factory.ts';
 import { detectProject } from './project-detect.ts';
+import { annotateAndFilterSuperseded, dedupChunks } from './search-quality.ts';
 import { coerceConcepts } from '../tools/learn.ts';
 import { createVectorProxy } from './vector-proxy.ts';
 
@@ -35,8 +36,10 @@ export async function handleSearch(
   mode: 'hybrid' | 'fts' | 'vector' = 'hybrid',
   project?: string,  // If set: project + universal. If null/undefined: universal only
   cwd?: string,      // Auto-detect project from cwd if project not specified
-  model?: string     // Embedding model: 'bge-m3' (default, multilingual) or 'nomic' (fast)
-): Promise<SearchResponse & { mode?: string; warning?: string; model?: string; vectorAvailable?: boolean }> {
+  model?: string,    // Embedding model: 'bge-m3' (default, multilingual) or 'nomic' (fast)
+  includeSuperseded: boolean = false,  // hidden by default; stored + flagged per P-001
+  dedupChunksFlag: boolean = true      // collapse section chunks per (project, source_file)
+): Promise<SearchResponse & { mode?: string; warning?: string; model?: string; vectorAvailable?: boolean; superseded_hidden?: number; deduped_removed?: number }> {
   // Auto-detect project from cwd if not explicitly specified
   const resolvedProject = (project ?? detectProject(cwd))?.toLowerCase() ?? null;
   const startTime = Date.now();
@@ -243,7 +246,13 @@ export async function handleSearch(
   }
 
   // Combine results using hybrid ranking
-  const combined = combineSearchResults(ftsResults, vectorResults);
+  let combined = combineSearchResults(ftsResults, vectorResults);
+
+  // Quality passes shared with the MCP path (src/server/search-quality.ts):
+  // same dedup key + same survivor rule on both paths (scoring stays per-path).
+  const supersededPass = annotateAndFilterSuperseded(sqlite, combined, includeSuperseded);
+  const dedupPass = dedupChunksFlag ? dedupChunks(supersededPass.results) : { results: supersededPass.results, removed: 0 };
+  combined = dedupPass.results;
   // For vector-only mode, ftsTotal is 0 and combined.length is just top-N,
   // so use the vector collection count as the total for accurate display
   let total = Math.max(ftsTotal, combined.length);
@@ -273,6 +282,8 @@ export async function handleSearch(
     mode,
     ...(model === 'multi' ? { model: 'multi' } : model && EMBEDDING_MODELS[model] ? { model } : {}),
     ...(mode !== 'fts' ? { vectorAvailable } : {}),
+    superseded_hidden: supersededPass.hidden,
+    deduped_removed: dedupPass.removed,
     ...(warning && { warning })
   };
 }

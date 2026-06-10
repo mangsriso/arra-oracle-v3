@@ -31,9 +31,11 @@ export const searchEndpoint = new Elysia().get(
     const project = query.project;
     const cwd = query.cwd;
     const model = query.model;
+    const includeSuperseded = query.include_superseded === 'true';
+    const dedupChunksFlag = query.dedup_chunks !== 'false';
 
     try {
-      const result = await handleSearch(sanitizedQ, type, limit, offset, mode, project, cwd, model);
+      const result = await handleSearch(sanitizedQ, type, limit, offset, mode, project, cwd, model, includeSuperseded, dedupChunksFlag);
       return { ...result, query: sanitizedQ };
     } catch {
       set.status = 400;

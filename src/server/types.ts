@@ -12,6 +12,8 @@ export interface SearchResult {
   score?: number;
   distance?: number;
   model?: string;
+  project?: string | null;
+  chunk_count?: number;
 }
 
 export interface SearchResponse {
