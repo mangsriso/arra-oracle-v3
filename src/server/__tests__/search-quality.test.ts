@@ -42,6 +42,17 @@ describe('annotateAndFilterSuperseded', () => {
     expect(hidden).toBe(0);
   });
 
+  test('kept superseded docs are FLAGGED so both paths can tell (HTTP has no enrichment)', () => {
+    const { results } = annotateAndFilterSuperseded(
+      db,
+      [{ id: 'a', source_file: 'f1' }, { id: 'b', source_file: 'f2' }, { id: 'c', source_file: 'f3' }],
+      true,
+    );
+    expect(results.find(r => r.id === 'a')?.superseded_by).toBeUndefined();
+    expect(results.find(r => r.id === 'b')?.superseded_by).toBe('_verified_orphan');
+    expect(results.find(r => r.id === 'c')?.superseded_by).toBe('learning_new');
+  });
+
   test('annotates project from DB without overwriting an existing value', () => {
     const { results } = annotateAndFilterSuperseded(
       db,

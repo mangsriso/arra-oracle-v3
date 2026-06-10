@@ -14,6 +14,7 @@ export interface QualityCandidate {
   source_file: string;
   project?: string | null;
   chunk_count?: number;
+  superseded_by?: string;
 }
 
 /**
@@ -45,9 +46,14 @@ export function annotateAndFilterSuperseded<T extends QualityCandidate>(
   for (const c of candidates) {
     const m = meta.get(c.id);
     if (c.project === undefined) c.project = m?.project ?? null;
-    if (!includeSuperseded && m?.superseded_by) {
-      hidden++;
-      continue;
+    if (m?.superseded_by) {
+      if (!includeSuperseded) {
+        hidden++;
+        continue;
+      }
+      // Kept on opt-in — flag it so callers on BOTH paths can tell which
+      // results are superseded (the HTTP path has no post-slice enrichment).
+      c.superseded_by = m.superseded_by;
     }
     out.push(c);
   }
