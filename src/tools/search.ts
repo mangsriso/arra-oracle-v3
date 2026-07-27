@@ -134,6 +134,39 @@ export function parseConceptsFromMetadata(concepts: unknown): string[] {
  * Vector search using ChromaMcpClient.
  * Performs semantic similarity search on the oracle_knowledge collection.
  */
+/**
+ * Look up authoritative `source_file` values for a batch of document ids.
+ *
+ * The DB is the authority; LanceDB metadata is an embed-time snapshot that goes
+ * stale the moment a document is rehomed to another project scope.
+ *
+ * Chunked because bun:sqlite rejects very large bind sets long before
+ * SQLITE_MAX_VARIABLE_NUMBER — Codex audit 2026-07-27: 65,536 ids threw
+ * "expected 0 values, received 65536", the caller's catch swallowed it, and every
+ * result silently reverted to stale metadata (a fail-open introduced while fixing
+ * a fail-silent).
+ *
+ * Ids with no row are simply absent from the returned map; the caller keeps
+ * whatever provenance it already had.
+ */
+export function resolveSourceFilesFromDb(
+  sqlite: { prepare: (sql: string) => { all: (...params: string[]) => unknown[] } },
+  ids: string[],
+  chunkSize = 500
+): Map<string, string> {
+  const out = new Map<string, string>();
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const slice = ids.slice(i, i + chunkSize);
+    const rows = sqlite
+      .prepare(
+        `SELECT id, source_file FROM oracle_documents WHERE id IN (${slice.map(() => '?').join(',')})`
+      )
+      .all(...slice) as Array<{ id: string; source_file: string }>;
+    for (const r of rows) out.set(r.id, r.source_file);
+  }
+  return out;
+}
+
 export async function vectorSearch(
   ctx: ToolContext,
   query: string,
@@ -203,21 +236,7 @@ export async function vectorSearch(
     if (mappedResults.length > 0) {
       try {
         const ids = mappedResults.map((r) => r.id);
-        // Chunk the IN-list. bun:sqlite rejects very large bind sets long before
-        // SQLITE_MAX_VARIABLE_NUMBER (Codex audit 2026-07-27: 65,536 ids threw
-        // "expected 0 values, received 65536", the catch below swallowed it, and
-        // every result silently fell back to stale vector metadata).
-        const CHUNK = 500;
-        const authoritative = new Map<string, string>();
-        for (let i = 0; i < ids.length; i += CHUNK) {
-          const slice = ids.slice(i, i + CHUNK);
-          const rows = ctx.sqlite
-            .prepare(
-              `SELECT id, source_file FROM oracle_documents WHERE id IN (${slice.map(() => '?').join(',')})`
-            )
-            .all(...slice) as Array<{ id: string; source_file: string }>;
-          for (const r of rows) authoritative.set(r.id, r.source_file);
-        }
+        const authoritative = resolveSourceFilesFromDb(ctx.sqlite, ids);
         // Ids present in the vector store but absent from oracle_documents keep
         // their embed-time metadata — there is nothing more authoritative to use.
         // Real example: learning_2026-05-24_vault-verify-marker-multiproject-…
