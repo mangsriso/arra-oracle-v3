@@ -38,6 +38,11 @@ let aliasLink: string;   // symlink pointing at realVault
 
 const SLUG = 'testowner/oracle-vault-test';
 
+// Each case spawns a subprocess, which is comfortably fast alone (~130ms) but can
+// exceed bun's 5s default when the whole suite runs in parallel. Measured: these
+// 14 tests silently dropped out of one full-suite run under load.
+const T = 20_000;
+
 function run(repoRoot: string, repoArg: string, withGhqOnPath = false): string {
   const PATH = withGhqOnPath
     ? `${process.env.HOME}/.local/bin:/usr/bin:/bin`
@@ -84,7 +89,7 @@ describe('resolveVaultPath — slug gating', () => {
     expect(out).toContain('not a valid owner/repo slug');
     expect(out.startsWith('OK:')).toBe(false);
     expect(out.split('\n')).toHaveLength(1); // no extra line from a spawned shell
-  });
+  }, T);
 
   it.each([
     'no-slash',
@@ -95,36 +100,36 @@ describe('resolveVaultPath — slug gating', () => {
     '',
   ])('refuses malformed slug %j', (bad) => {
     expect(run(realVault, bad, true)).toContain('not a valid owner/repo slug');
-  });
+  }, T);
 });
 
 describe('resolveVaultPath — REPO_ROOT fast path', () => {
   it('resolves without ghq on PATH when REPO_ROOT is the vault', () => {
     expect(run(realVault, SLUG)).toBe(`OK:${realVault}`);
-  });
+  }, T);
 
   it('strips a trailing slash rather than leaking it into derived paths', () => {
     expect(run(`${realVault}//`, SLUG)).toBe(`OK:${realVault}`);
-  });
+  }, T);
 
   it('rejects a same-suffix path that is not a git repo', () => {
     expect(run(decoyNoGit, SLUG)).toContain('THREW:');
-  });
+  }, T);
 
   it('rejects a differently-cased sibling on a case-sensitive host', () => {
     expect(run(decoyCase, SLUG)).toContain('THREW:');
-  });
+  }, T);
 
   it('follows a symlink alias to the real vault', () => {
     expect(run(aliasLink, SLUG)).toBe(`OK:${realVault}`);
-  });
+  }, T);
 
   it('tolerates a .git suffix on the configured slug', () => {
     expect(run(realVault, `${SLUG}.git`)).toBe(`OK:${realVault}`);
-  });
+  }, T);
 
   it('does not match when the slug is merely a suffix of the directory name', () => {
     // '.../oracle-vault-test' must not satisfy the slug 'testowner/vault-test'
     expect(run(realVault, 'testowner/vault-test')).toContain('THREW:');
-  });
+  }, T);
 });

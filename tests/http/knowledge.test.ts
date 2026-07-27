@@ -24,10 +24,86 @@ const waitUp = async (n = 30) => {
 const post = (url: string, body: unknown) =>
   fetch(`${BASE_URL}${url}`, { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) });
 
+/**
+ * Everything this suite creates, so afterAll can remove it.
+ *
+ * These tests seed the LIVE Oracle on BASE_URL — a real learning file in the
+ * real vault plus a real oracle_documents/oracle_fts row per POST. Until
+ * 2026-07-27 nothing cleaned up, so 33 `yellow-*` artifacts had accumulated in
+ * the production knowledge base across four test runs (2026-05-10, 05-15,
+ * 06-10, 07-27), all with project=null, which means they leaked into every
+ * project scope's search results.
+ */
+const created: Array<{ id?: string; file?: string }> = [];
+
 async function seedLearn(pattern: string, concepts: string[] = []) {
   const res = await post("/api/learn", { pattern, source: SEED_TAG, concepts: [SEED_TAG, ...concepts] });
   if (!res.ok) throw new Error(`seed failed (${res.status}): ${await res.text()}`);
-  return res.json();
+  const json = await res.json();
+  created.push({ id: json?.id, file: json?.file });
+  return json;
+}
+
+/**
+ * Candidate roots the returned `file` paths could be relative to, best first.
+ * No hardcoded host paths: /api/health reports repoRoot, and the vault root is
+ * derived the same way the server derives it (settings.vault_repo -> ghq).
+ */
+async function candidateRoots(): Promise<string[]> {
+  const out: string[] = [];
+  try {
+    const h = await (await fetch(`${BASE_URL}/api/health`)).json();
+    if (typeof h?.repoRoot === "string" && h.repoRoot) out.push(h.repoRoot);
+  } catch { /* older build has no repoRoot field */ }
+  if (process.env.ORACLE_REPO_ROOT) out.push(process.env.ORACLE_REPO_ROOT);
+  try {
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(dbPath(), { readonly: true });
+    const repo = (db.prepare("SELECT value FROM settings WHERE key='vault_repo'").get() as { value?: string } | null)?.value;
+    db.close();
+    if (repo && /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repo)) {
+      const p = Bun.spawnSync({ cmd: ["ghq", "list", "-p", repo] });
+      const first = new TextDecoder().decode(p.stdout).trim().split("\n")[0]?.trim();
+      if (first) out.push(first);
+    }
+  } catch { /* ghq unavailable or settings unreadable */ }
+  if (process.env.HOME) out.push(path.join(process.env.HOME, ".arra-oracle-v2"));
+  return out;
+}
+
+function dbPath(): string {
+  return process.env.ORACLE_DB_PATH
+    || path.join(process.env.HOME ?? "", ".arra-oracle-v2", "oracle.db");
+}
+
+/** Remove the files and rows this suite created. Never throws — cleanup is best-effort. */
+async function cleanupSeeded(): Promise<{ removed: number; missed: string[] }> {
+  const fs = await import("fs");
+  const roots = await candidateRoots();
+  let removed = 0;
+  const missed: string[] = [];
+  for (const c of created) {
+    if (!c.file) continue;
+    // The API returns a vault-relative path; try each candidate root until one hits.
+    const hit = roots.map((r) => path.join(r, c.file!)).find((p) => fs.existsSync(p));
+    if (hit) { try { fs.rmSync(hit, { force: true }); removed++; } catch { missed.push(c.file); } }
+    else missed.push(c.file);
+  }
+  try {
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(dbPath());
+    const ids = created.map((c) => c.id).filter((x): x is string => Boolean(x));
+    for (const id of ids) {
+      db.prepare("DELETE FROM oracle_documents WHERE id = ?").run(id);
+      db.prepare("DELETE FROM oracle_fts WHERE id = ?").run(id);
+    }
+    // Anything tagged by this run that we did not capture an id for.
+    db.prepare("DELETE FROM oracle_documents WHERE source_file LIKE ?").run(`%${SEED_TAG}%`);
+    db.prepare("DELETE FROM learn_log WHERE source = ?").run(SEED_TAG);
+    db.prepare("DELETE FROM supersede_log WHERE reason = ?").run("yellow http contract test");
+    db.close();
+  } catch { /* ignore — a failed cleanup must not fail the suite */ }
+  return { removed, missed };
 }
 
 describe("HTTP Contract — search / knowledge / supersede", () => {
@@ -40,7 +116,16 @@ describe("HTTP Contract — search / knowledge / supersede", () => {
     });
     if (!(await waitUp())) throw new Error("Server failed to start within 15s");
   }, 30_000);
-  afterAll(() => { if (serverProcess) serverProcess.kill(); });
+  afterAll(async () => {
+    const { removed, missed } = await cleanupSeeded();
+    // Loud, because a silent cleanup failure is how 33 artifacts accumulated.
+    if (missed.length) {
+      console.error(`[knowledge.test] cleanup MISSED ${missed.length} file(s) — remove by hand: ${missed.join(", ")}`);
+    } else {
+      console.error(`[knowledge.test] cleanup removed ${removed} seeded file(s)`);
+    }
+    if (serverProcess) serverProcess.kill();
+  });
 
   describe("POST /api/learn", () => {
     test("creates a learning doc", async () => {
@@ -160,6 +245,7 @@ describe("HTTP Contract — search / knowledge / supersede", () => {
       const res = await post("/api/handoff", { content: `test handoff ${slug}`, slug });
       expect(res.status).toBe(201);
       const data = await res.json();
+      created.push({ file: data?.file }); // so afterAll removes it from the real inbox
       expect(data.success).toBe(true);
       expect(data.file).toContain(slug);
     });
