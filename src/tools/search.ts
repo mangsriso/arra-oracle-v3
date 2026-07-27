@@ -203,12 +203,28 @@ export async function vectorSearch(
     if (mappedResults.length > 0) {
       try {
         const ids = mappedResults.map((r) => r.id);
-        const rows = ctx.sqlite
-          .prepare(
-            `SELECT id, source_file FROM oracle_documents WHERE id IN (${ids.map(() => '?').join(',')})`
-          )
-          .all(...ids) as Array<{ id: string; source_file: string }>;
-        const authoritative = new Map(rows.map((r) => [r.id, r.source_file]));
+        // Chunk the IN-list. bun:sqlite rejects very large bind sets long before
+        // SQLITE_MAX_VARIABLE_NUMBER (Codex audit 2026-07-27: 65,536 ids threw
+        // "expected 0 values, received 65536", the catch below swallowed it, and
+        // every result silently fell back to stale vector metadata).
+        const CHUNK = 500;
+        const authoritative = new Map<string, string>();
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          const slice = ids.slice(i, i + CHUNK);
+          const rows = ctx.sqlite
+            .prepare(
+              `SELECT id, source_file FROM oracle_documents WHERE id IN (${slice.map(() => '?').join(',')})`
+            )
+            .all(...slice) as Array<{ id: string; source_file: string }>;
+          for (const r of rows) authoritative.set(r.id, r.source_file);
+        }
+        // Ids present in the vector store but absent from oracle_documents keep
+        // their embed-time metadata — there is nothing more authoritative to use.
+        // Real example: learning_2026-05-24_vault-verify-marker-multiproject-…
+        const orphans = ids.length - authoritative.size;
+        if (orphans > 0) {
+          console.error(`[VectorSearch] ${orphans}/${ids.length} ids absent from oracle_documents — those keep vector metadata`);
+        }
         for (const r of mappedResults) {
           const fromDb = authoritative.get(r.id);
           if (fromDb) r.source_file = fromDb;

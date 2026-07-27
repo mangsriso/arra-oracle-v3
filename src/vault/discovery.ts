@@ -40,10 +40,24 @@ export function resolveVaultPath(repo: string): string {
   // arra_learn silently fell back to writing EVERY learning into the vault's own
   // project scope instead of the caller's (49 misfiled before it was noticed).
   // When REPO_ROOT already is the configured vault, trust it and skip the shell.
-  const slug = repo.replace(/\.git$/, '').toLowerCase();
-  const root = (REPO_ROOT || '').replace(/\/+$/, '');
-  if (root && root.toLowerCase().endsWith(`/${slug}`)) {
-    return root; // normalized: a trailing-slash ORACLE_REPO_ROOT must not leak into every derived path
+  // `repo` comes from the settings table and is interpolated into a shell
+  // command below, so gate it before it can reach one. Codex audit 2026-07-27:
+  // resolveVaultPath('missing; printf SHELL_INJECTION') executed the fragment.
+  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repo)) {
+    throw new Error(`Vault repo "${repo}" is not a valid owner/repo slug.`);
+  }
+
+  const slug = repo.replace(/\.git$/, '');
+  let root = (REPO_ROOT || '').replace(/\/+$/, ''); // a trailing slash must not leak into derived paths
+  // realpath so a symlink alias to the real vault still matches (the previous
+  // version failed that case whenever ghq was unavailable).
+  try { root = fs.realpathSync(root); } catch { /* keep the literal value */ }
+  // A textual suffix is not proof of identity — any fabricated path ending in
+  // ".../<owner>/<repo>" satisfied it, and the lowercase compare additionally
+  // accepted a differently-cased sibling on this case-sensitive host (both found
+  // by the same audit). Require a case-exact suffix AND a real git repo there.
+  if (root.endsWith(`/${slug}`) && fs.existsSync(path.join(root, '.git'))) {
+    return root;
   }
   try {
     const output = execSync(`ghq list -p ${repo}`, { encoding: 'utf-8' }).trim();
