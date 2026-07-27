@@ -17,9 +17,16 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+
+/** A real work tree — an empty `.git` directory is NOT one, and the resolver now proves it. */
+function makeRepo(dir: string) {
+  fs.mkdirSync(dir, { recursive: true });
+  execFileSync('git', ['-C', dir, 'init', '-q'], { stdio: 'ignore' });
+}
 
 const DISCOVERY = path.resolve(import.meta.dir, '..', 'discovery.ts');
 
@@ -35,6 +42,8 @@ let realVault: string;   // a genuine git repo at .../owner/oracle-vault-test
 let decoyNoGit: string;  // same suffix, not a git repo
 let decoyCase: string;   // differently-cased sibling, is a git repo
 let aliasLink: string;   // symlink pointing at realVault
+let decoyGitFile: string;  // `.git` is an ordinary FILE
+let decoyGitEmpty: string; // `.git` is an EMPTY directory
 
 const SLUG = 'testowner/oracle-vault-test';
 
@@ -62,13 +71,21 @@ beforeAll(() => {
   fs.writeFileSync(runnerPath, RUNNER);
 
   realVault = path.join(tmp, 'real', 'testowner', 'oracle-vault-test');
-  fs.mkdirSync(path.join(realVault, '.git'), { recursive: true });
+  makeRepo(realVault);
 
   decoyNoGit = path.join(tmp, 'decoy', 'testowner', 'oracle-vault-test');
   fs.mkdirSync(decoyNoGit, { recursive: true });
 
   decoyCase = path.join(tmp, 'case', 'TestOwner', 'Oracle-Vault-Test');
-  fs.mkdirSync(path.join(decoyCase, '.git'), { recursive: true });
+  makeRepo(decoyCase);
+
+  // Codex audit 2026-07-27: `fs.existsSync(dir + '/.git')` accepted BOTH of these.
+  decoyGitFile = path.join(tmp, 'gitfile', 'testowner', 'oracle-vault-test');
+  fs.mkdirSync(decoyGitFile, { recursive: true });
+  fs.writeFileSync(path.join(decoyGitFile, '.git'), 'gitdir: /nowhere\n');
+
+  decoyGitEmpty = path.join(tmp, 'gitempty', 'testowner', 'oracle-vault-test');
+  fs.mkdirSync(path.join(decoyGitEmpty, '.git'), { recursive: true });
 
   aliasLink = path.join(tmp, 'alias');
   fs.symlinkSync(realVault, aliasLink);
@@ -126,6 +143,14 @@ describe('resolveVaultPath — REPO_ROOT fast path', () => {
 
   it('tolerates a .git suffix on the configured slug', () => {
     expect(run(realVault, `${SLUG}.git`)).toBe(`OK:${realVault}`);
+  }, T);
+
+  it('rejects a decoy whose .git is an ordinary file', () => {
+    expect(run(decoyGitFile, SLUG)).toContain('THREW:');
+  }, T);
+
+  it('rejects a decoy whose .git is an empty directory', () => {
+    expect(run(decoyGitEmpty, SLUG)).toContain('THREW:');
   }, T);
 
   it('does not match when the slug is merely a suffix of the directory name', () => {

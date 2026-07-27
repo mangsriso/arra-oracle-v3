@@ -79,14 +79,33 @@ describe('resolveSourceFilesFromDb', () => {
     db.close();
   });
 
-  it('reproduces the real fail-open boundary: 65536 ids in one query throws, chunked does not', () => {
-    // bun:sqlite throws at exactly 2^16 parameters — measured, not assumed:
-    // 65535 binds fine, 65536 gives "SQLite query expected 0 values, received 65536".
-    // Rows are unnecessary; the failure is at bind time.
+  it('a single un-chunked query at the 2^16 bind boundary no longer throws — it degrades', () => {
+    // SPEC CHANGE, deliberate (2026-07-27, second Codex audit): this used to be
+    // asserted as `toThrow()`. Throwing was the fail-OPEN — the caller's outer
+    // catch swallowed it and every result reverted to stale vector metadata. The
+    // contract is now per-chunk isolation: a failing chunk is logged and skipped,
+    // succeeding chunks are kept. The expectation moved because the requirement
+    // moved, not to make a red test green.
+    //
+    // bun:sqlite rejects bind sets at exactly 2^16 — measured, not assumed:
+    // 65535 binds fine, 65536 gives "expected 0 values, received 65536".
     const db = makeDb([]);
     const ids = Array.from({ length: 65_536 }, (_, i) => `id_${i}`);
-    expect(() => resolveSourceFilesFromDb(db, ids, 1_000_000)).toThrow(/received 65536/);
-    expect(resolveSourceFilesFromDb(db, ids).size).toBe(0); // chunked: no throw
+    expect(() => resolveSourceFilesFromDb(db, ids, 1_000_000)).not.toThrow();
+    expect(resolveSourceFilesFromDb(db, ids, 1_000_000).size).toBe(0); // degraded, not fatal
+    expect(resolveSourceFilesFromDb(db, ids).size).toBe(0);            // chunked: also fine, table empty
+    db.close();
+  });
+
+  it('isolates a failing chunk: earlier chunks survive it', () => {
+    const rows: Array<[string, string]> = Array.from({ length: 10 }, (_, i) => [`id_${i}`, `f_${i}.md`]);
+    const db = makeDb(rows);
+    let calls = 0;
+    const flaky = { prepare: (sql: string) => { calls++; if (calls === 2) throw new Error('simulated chunk-2 failure'); return db.prepare(sql); } };
+    const got = resolveSourceFilesFromDb(flaky, rows.map(([id]) => id), 5);
+    expect(got.size).toBe(5);              // chunk 1 kept
+    expect(got.get('id_0')).toBe('f_0.md');
+    expect(got.has('id_5')).toBe(false);   // chunk 2 lost, and only chunk 2
     db.close();
   });
 

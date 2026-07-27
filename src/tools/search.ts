@@ -157,12 +157,22 @@ export function resolveSourceFilesFromDb(
   const out = new Map<string, string>();
   for (let i = 0; i < ids.length; i += chunkSize) {
     const slice = ids.slice(i, i + chunkSize);
-    const rows = sqlite
-      .prepare(
-        `SELECT id, source_file FROM oracle_documents WHERE id IN (${slice.map(() => '?').join(',')})`
-      )
-      .all(...slice) as Array<{ id: string; source_file: string }>;
-    for (const r of rows) out.set(r.id, r.source_file);
+    // Per-chunk isolation. A single throwing chunk must not discard the chunks
+    // that already succeeded — the caller's outer catch used to swallow the
+    // exception and fall back to stale metadata for the ENTIRE result set, so a
+    // failure on chunk 2 of 5 silently poisoned chunk 1's correct provenance.
+    // Found by a second Codex audit, 2026-07-27.
+    try {
+      const rows = sqlite
+        .prepare(
+          `SELECT id, source_file FROM oracle_documents WHERE id IN (${slice.map(() => '?').join(',')})`
+        )
+        .all(...slice) as Array<{ id: string; source_file: string }>;
+      for (const r of rows) out.set(r.id, r.source_file);
+    } catch (e) {
+      // Name the failing range so a partial result is diagnosable, not silent.
+      console.error(`[resolveSourceFilesFromDb] chunk ${i}..${i + slice.length - 1} failed, those ids keep vector metadata: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   return out;
 }

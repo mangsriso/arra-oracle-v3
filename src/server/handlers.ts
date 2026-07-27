@@ -177,13 +177,38 @@ export async function handleSearch(
 
         if (!chromaResults.ids || chromaResults.ids.length === 0) return [];
 
-        // Get project metadata
-        const rows = db.select({ id: oracleDocuments.id, project: oracleDocuments.project })
+        // Get project AND source_file from the DB.
+        //
+        // source_file must come from here, not from the vector metadata: metadata
+        // is an embed-time snapshot and goes stale the moment a document moves.
+        // Verified 2026-07-27 via a second Codex audit — this route was still
+        // serving pre-repair paths like `…/sda-script</ψ/…` for documents whose
+        // rows had been repointed hours earlier, and `/api/file` answered 404 on
+        // them while `/api/doc/:id` answered 200 for the same document. The MCP
+        // path (tools/search.ts) had already been fixed; this is the twin
+        // handler that HTTP uses, and fixing only one of the two left a live
+        // user-visible broken journey.
+        const rows = db.select({
+          id: oracleDocuments.id,
+          project: oracleDocuments.project,
+          sourceFile: oracleDocuments.sourceFile,
+        })
           .from(oracleDocuments)
           .where(inArray(oracleDocuments.id, chromaResults.ids))
           .all();
         const projectMap = new Map<string, string | null>();
-        rows.forEach(r => projectMap.set(r.id, r.project));
+        const sourceFileMap = new Map<string, string>();
+        rows.forEach(r => {
+          projectMap.set(r.id, r.project);
+          if (r.sourceFile) sourceFileMap.set(r.id, r.sourceFile);
+        });
+        // Ids present in the vector store but absent from oracle_documents keep
+        // their embed-time metadata — there is nothing more authoritative. Name
+        // them, so a stale-provenance result is diagnosable instead of silent.
+        const unresolved = chromaResults.ids.filter((id: string) => !sourceFileMap.has(id));
+        if (unresolved.length > 0) {
+          console.error(`[Vector] ${unresolved.length}/${chromaResults.ids.length} ids absent from oracle_documents — keeping vector metadata for: ${unresolved.slice(0, 5).join(', ')}${unresolved.length > 5 ? ' …' : ''}`);
+        }
 
         return chromaResults.ids
           .map((id: string, i: number) => {
@@ -194,7 +219,8 @@ export async function handleSearch(
               id,
               type: chromaResults.metadatas?.[i]?.type || 'unknown',
               content: chromaResults.documents?.[i] || '',
-              source_file: chromaResults.metadatas?.[i]?.source_file || '',
+              // DB wins; metadata only as a last resort for ids with no row.
+              source_file: sourceFileMap.get(id) || chromaResults.metadatas?.[i]?.source_file || '',
               concepts: [],
               project: docProject,
               source: 'vector' as const,

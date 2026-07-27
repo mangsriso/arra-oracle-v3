@@ -4,7 +4,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { getSetting } from '../db/index.ts';
 import { REPO_ROOT } from '../config.ts';
 
@@ -56,15 +56,42 @@ export function resolveVaultPath(repo: string): string {
   // ".../<owner>/<repo>" satisfied it, and the lowercase compare additionally
   // accepted a differently-cased sibling on this case-sensitive host (both found
   // by the same audit). Require a case-exact suffix AND a real git repo there.
-  if (root.endsWith(`/${slug}`) && fs.existsSync(path.join(root, '.git'))) {
+  if (root.endsWith(`/${slug}`) && isGitWorkTree(root)) {
     return root;
   }
   try {
-    const output = execSync(`ghq list -p ${repo}`, { encoding: 'utf-8' }).trim();
+    // execFileSync with an argument array — no shell, so the slug can never be
+    // reinterpreted even if the regex above is ever loosened.
+    const output = execFileSync('ghq', ['list', '-p', repo], { encoding: 'utf-8' }).trim();
     if (!output) throw new Error('empty output');
-    return output.split('\n')[0].trim();
+    const candidate = output.split('\n')[0].trim();
+    // `ghq` (or anything shadowing it on PATH) is not trusted to return a repo:
+    // a stub that prints a plain directory was accepted before this check.
+    if (!isGitWorkTree(candidate)) {
+      throw new Error(`ghq returned a non-repository: ${candidate}`);
+    }
+    return candidate;
+  } catch (e) {
+    throw new Error(`Vault repo "${repo}" not found via ghq. Run vault:init first.${e instanceof Error ? ` (${e.message})` : ''}`);
+  }
+}
+
+/**
+ * Prove a path really is a git work tree.
+ *
+ * `fs.existsSync(dir + '/.git')` is NOT proof — a Codex audit (2026-07-27)
+ * accepted a decoy whose `.git` was an ordinary FILE, and another whose `.git`
+ * was an empty directory. Ask git instead.
+ */
+function isGitWorkTree(dir: string): boolean {
+  if (!dir || !fs.existsSync(dir)) return false;
+  try {
+    return execFileSync('git', ['-C', dir, 'rev-parse', '--is-inside-work-tree'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() === 'true';
   } catch {
-    throw new Error(`Vault repo "${repo}" not found via ghq. Run vault:init first.`);
+    return false;
   }
 }
 
