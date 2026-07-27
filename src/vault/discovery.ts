@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import { getSetting } from '../db/index.ts';
+import { REPO_ROOT } from '../config.ts';
 
 /**
  * Walk all files under dir, skipping symlinks.
@@ -32,6 +33,18 @@ export function walkFiles(
 }
 
 export function resolveVaultPath(repo: string): string {
+  // PATH-independent fast path. Shelling out to `ghq` to locate a path this
+  // process already holds makes vault resolution depend on the caller's PATH.
+  // 2026-07-26: oracle-server runs from a systemd user unit whose default PATH
+  // excludes ~/.local/bin (where ghq lives) — `ghq` exited 127, this threw, and
+  // arra_learn silently fell back to writing EVERY learning into the vault's own
+  // project scope instead of the caller's (49 misfiled before it was noticed).
+  // When REPO_ROOT already is the configured vault, trust it and skip the shell.
+  const slug = repo.replace(/\.git$/, '').toLowerCase();
+  const root = (REPO_ROOT || '').replace(/\/+$/, '');
+  if (root && root.toLowerCase().endsWith(`/${slug}`)) {
+    return root; // normalized: a trailing-slash ORACLE_REPO_ROOT must not leak into every derived path
+  }
   try {
     const output = execSync(`ghq list -p ${repo}`, { encoding: 'utf-8' }).trim();
     if (!output) throw new Error('empty output');

@@ -193,6 +193,32 @@ export async function vectorSearch(
       });
     }
 
+    // The DB is the authority for source_file, not the vector metadata.
+    // Metadata is a snapshot taken at embed time and goes stale the moment a
+    // document is rehomed to another project scope. Verified 2026-07-27: after
+    // 49 misfiled learnings were moved, vector results still reported their old
+    // path and `arra_read({file})` on that path returned "File not found",
+    // while `arra_read({id})` worked. Re-embedding would fix those 49; joining
+    // the DB fixes the whole class, for every future move.
+    if (mappedResults.length > 0) {
+      try {
+        const ids = mappedResults.map((r) => r.id);
+        const rows = ctx.sqlite
+          .prepare(
+            `SELECT id, source_file FROM oracle_documents WHERE id IN (${ids.map(() => '?').join(',')})`
+          )
+          .all(...ids) as Array<{ id: string; source_file: string }>;
+        const authoritative = new Map(rows.map((r) => [r.id, r.source_file]));
+        for (const r of mappedResults) {
+          const fromDb = authoritative.get(r.id);
+          if (fromDb) r.source_file = fromDb;
+        }
+      } catch (e) {
+        // Never fail a search over provenance enrichment — fall back to metadata.
+        console.error('[VectorSearch] source_file DB join failed:', e instanceof Error ? e.message : String(e));
+      }
+    }
+
     return mappedResults;
   } catch (error) {
     const errorMsg = error instanceof Error ? error.stack || error.message : String(error);

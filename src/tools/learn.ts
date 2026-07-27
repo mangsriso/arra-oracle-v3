@@ -8,6 +8,7 @@
 import path from 'path';
 import fs from 'fs';
 import { oracleDocuments } from '../db/schema.ts';
+import { getSetting } from '../db/index.ts';
 import { detectProject } from '../server/project-detect.ts';
 import { getVaultPsiRoot } from '../vault/handler.ts';
 import { getVectorStoreByModel, getEmbeddingModels } from '../vector/factory.ts';
@@ -130,6 +131,15 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
   const vault = getVaultPsiRoot();
   if ('needsInit' in vault) console.error(`[Vault] ${vault.hint}`);
   const vaultRoot = 'path' in vault ? vault.path : null;
+  // Fail loud, not silent. A console.error into a tmux pane nobody reads is a
+  // silent failure: between 2026-06 and 2026-07 this branch misfiled 49
+  // learnings into the vault's own project scope with zero visible signal.
+  // If a vault IS configured but did not resolve, that is a broken environment,
+  // not a "no vault configured" state — surface it in the tool response so the
+  // caller sees it on the very first write.
+  const vaultWarning = ('needsInit' in vault && getSetting('vault_repo'))
+    ? `vault configured but unresolved — this learning is being written OUTSIDE its project scope. ${vault.hint}`
+    : null;
 
   const project = normalizeProject(projectInput)
     || extractProjectFromSource(source)
@@ -249,7 +259,8 @@ export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Pr
         file: sourceFileRel,
         id,
         embedding: embeddingStatus,
-        message: `Pattern added to Oracle knowledge base${vaultRoot ? ' (vault)' : ''}${embeddingStatus === 'failed' ? ' — vector embedding failed, see server log' : ''}`
+        ...(vaultWarning ? { warning: vaultWarning } : {}),
+        message: `Pattern added to Oracle knowledge base${vaultRoot ? ' (vault)' : ''}${vaultWarning ? ' — ⚠️ WRONG SCOPE, see warning' : ''}${embeddingStatus === 'failed' ? ' — vector embedding failed, see server log' : ''}`
       }, null, 2)
     }]
   };
