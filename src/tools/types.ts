@@ -18,6 +18,8 @@ export interface ToolContext {
   vectorStore: VectorStoreAdapter;
   vectorStatus: 'unknown' | 'connected' | 'empty' | 'unavailable';
   version: string;
+  /** False when a read-only dispatcher allows reads but suppresses telemetry writes. */
+  telemetryEnabled?: boolean;
 }
 
 export interface ToolResponse {
