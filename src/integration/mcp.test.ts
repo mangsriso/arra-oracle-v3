@@ -103,7 +103,7 @@ const MCP_TEST_ENABLED = process.env.MCP_TEST === "1";
 describe.skipIf(!MCP_TEST_ENABLED)("MCP Integration", () => {
   beforeAll(async () => {
     // Start MCP server
-    mcpProcess = Bun.spawn(["bun", "run", "src/index.ts"], {
+    mcpProcess = Bun.spawn([process.execPath, "src/index.ts"], {
       cwd: import.meta.dir.replace("/src/integration", ""),
       stdin: "pipe",
       stdout: "pipe",

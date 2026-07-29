@@ -47,6 +47,17 @@ export interface SyncResult {
   commitHash?: string; project?: string | null;
 }
 
+interface SyncWrite {
+  source: string;
+  dest: string;
+  taggedContent?: string;
+}
+
+interface SyncDelete {
+  file: string;
+  stopAt: string;
+}
+
 export function syncVault(opts: { dryRun?: boolean; repoRoot: string }): SyncResult {
   const { dryRun = false, repoRoot } = opts;
   const repo = getSetting('vault_repo');
@@ -61,26 +72,35 @@ export function syncVault(opts: { dryRun?: boolean; repoRoot: string }): SyncRes
 
   const diskFiles = walkFiles(psiDir, repoRoot);
   const vaultDestPaths = new Set<string>();
+  const writes: SyncWrite[] = [];
+  const deletes: SyncDelete[] = [];
+  let previewAdded = 0;
+  let previewModified = 0;
 
   for (const { relativePath, fullPath } of diskFiles) {
     const vaultRelPath = mapToVaultPath(relativePath, project);
     vaultDestPaths.add(vaultRelPath);
     const dest = path.join(vaultPath, vaultRelPath);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    let taggedContent: string | undefined;
+    let plannedContent: Buffer;
     if (project && fullPath.endsWith('.md') && isProjectCategory(relativePath)) {
-      const tagged = ensureFrontmatterProject(fs.readFileSync(fullPath, 'utf-8'), project);
-      fs.writeFileSync(dest, tagged);
+      taggedContent = ensureFrontmatterProject(fs.readFileSync(fullPath, 'utf-8'), project);
+      plannedContent = Buffer.from(taggedContent);
     } else {
-      fs.copyFileSync(fullPath, dest);
+      plannedContent = fs.readFileSync(fullPath);
     }
+    writes.push({ source: fullPath, dest, taggedContent });
+
+    if (!fs.existsSync(dest)) previewAdded++;
+    else if (!fs.readFileSync(dest).equals(plannedContent)) previewModified++;
   }
 
-  // Clean up vault files that no longer exist locally
+  // Plan vault files that no longer exist locally.
   if (project) {
     const vaultProjectDir = path.join(vaultPath, project, 'ψ');
     if (fs.existsSync(vaultProjectDir)) {
       for (const { relativePath: vr, fullPath: vf } of walkFiles(vaultProjectDir, vaultPath)) {
-        if (!vaultDestPaths.has(vr)) { fs.unlinkSync(vf); cleanEmptyDirs(path.dirname(vf), path.join(vaultPath, project)); }
+        if (!vaultDestPaths.has(vr)) deletes.push({ file: vf, stopAt: path.join(vaultPath, project) });
       }
     }
   }
@@ -88,14 +108,28 @@ export function syncVault(opts: { dryRun?: boolean; repoRoot: string }): SyncRes
     const vaultCategoryDir = path.join(vaultPath, category);
     if (!fs.existsSync(vaultCategoryDir)) continue;
     for (const { relativePath: vr, fullPath: vf } of walkFiles(vaultCategoryDir, vaultPath)) {
-      if (!vaultDestPaths.has(vr)) { fs.unlinkSync(vf); cleanEmptyDirs(path.dirname(vf), path.join(vaultPath, 'ψ')); }
+      if (!vaultDestPaths.has(vr)) deletes.push({ file: vf, stopAt: path.join(vaultPath, 'ψ') });
     }
+  }
+
+  if (dryRun) {
+    return { dryRun: true, added: previewAdded, modified: previewModified, deleted: deletes.length, project };
+  }
+
+  for (const { source, dest, taggedContent } of writes) {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    if (taggedContent !== undefined) fs.writeFileSync(dest, taggedContent);
+    else fs.copyFileSync(source, dest);
+  }
+  for (const { file, stopAt } of deletes) {
+    fs.unlinkSync(file);
+    cleanEmptyDirs(path.dirname(file), stopAt);
   }
 
   execSync('git add -A', { cwd: vaultPath, stdio: 'pipe' });
   const status = execSync('git status --porcelain', { cwd: vaultPath, encoding: 'utf-8' }).trim();
   const { added, modified, deleted } = parseGitStatus(status);
-  if (dryRun || !status) return { dryRun: true, added, modified, deleted, project };
+  if (!status) return { dryRun: true, added, modified, deleted, project };
 
   const now = new Date();
   const ts = now.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');

@@ -1,7 +1,7 @@
 /**
  * arra-indexer daemon entrypoint — Elysia (M3, ported from alpha's Hono).
  *
- * Wires the real adapters (SQLite db, OllamaEmbeddings, LanceDB) into the
+ * Wires the real adapters (SQLite db, configured embeddings, LanceDB) into the
  * pure M2 worker loop, exposes the M3 HTTP API as an Elysia plugin, and
  * handles graceful shutdown on SIGTERM/SIGINT.
  *
@@ -17,6 +17,7 @@ import Database from 'bun:sqlite';
 import { Elysia } from 'elysia';
 import { DB_PATH, LANCEDB_DIR } from '../config.ts';
 import { createVectorStore, getEmbeddingModels } from '../vector/factory.ts';
+import { resolveEmbeddingRuntime } from '../vector/runtime-config.ts';
 import { runWorker, type WorkerEvent } from './worker.ts';
 import { daemonApiPlugin, makeEventBus } from '../routes/indexer-daemon/index.ts';
 
@@ -40,18 +41,21 @@ export async function startDaemon(): Promise<void> {
     return row?.content ?? null;
   };
 
-  // Embed via the existing factory — produces a model-aware OllamaEmbeddings.
+  // Embed via the existing factory using the deployed provider/model identity.
   // Lazy per model so we don't spin up unused embedders.
   const stores = new Map<string, ReturnType<typeof createVectorStore>>();
   const getStore = async (modelKey: string, collection: string) => {
     let s = stores.get(modelKey);
     if (!s) {
+      const preset = models[modelKey];
+      if (!preset) throw new Error(`Unknown model_key: ${modelKey}`);
+      const embedding = resolveEmbeddingRuntime(preset);
       s = createVectorStore({
         type: 'lancedb',
-        dataPath: LANCEDB_DIR,
+        dataPath: preset.dataPath || LANCEDB_DIR,
         collectionName: collection,
-        embeddingProvider: 'ollama',
-        embeddingModel: modelKey,
+        embeddingProvider: embedding.provider,
+        embeddingModel: embedding.model,
       });
       await s.connect();
       await s.ensureCollection();
@@ -77,7 +81,7 @@ export async function startDaemon(): Promise<void> {
     const store = await getStore(modelKey, collection);
     await store.addDocuments([{ id: docId, document: '', metadata: { id: docId, indexed_at: Date.now() } }]);
     // TODO: extend VectorStoreAdapter with `upsert(id, vector, metadata)`
-    // that doesn't re-embed. For now we accept the extra Ollama call.
+    // that doesn't re-embed. For now we accept the extra provider call.
     void vector;
   };
 

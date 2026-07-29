@@ -10,7 +10,10 @@ import path from 'path';
  * Scans {host}/{org}/{repo}/psi/ at repoRoot for github.com, gitlab.com, bitbucket.org.
  * Returns absolute paths to each project's psi directory.
  */
-export function discoverProjectPsiDirs(repoRoot: string): string[] {
+export function discoverProjectPsiDirs(
+  repoRoot: string,
+  options: { quiet?: boolean } = {},
+): string[] {
   const dirs: string[] = [];
   const hosts = ['github.com', 'gitlab.com', 'bitbucket.org'];
 
@@ -31,7 +34,7 @@ export function discoverProjectPsiDirs(repoRoot: string): string[] {
     }
   }
 
-  if (dirs.length > 0) {
+  if (dirs.length > 0 && !options.quiet) {
     console.log(`Discovered ${dirs.length} project-first \u03c8/ directories`);
   }
   return dirs;

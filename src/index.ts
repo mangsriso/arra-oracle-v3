@@ -16,71 +16,21 @@ import { type BunSQLiteDatabase } from 'drizzle-orm/bun-sqlite';
 import { Database } from 'bun:sqlite';
 import * as schema from './db/schema.ts';
 import { createDatabase } from './db/index.ts';
-import { createVectorStore } from './vector/factory.ts';
+import {
+  createVectorStore,
+  resolveVectorStoreConfigForModel,
+} from './vector/factory.ts';
 import type { VectorStoreAdapter } from './vector/types.ts';
 import path from 'path';
 import fs from 'fs';
 import { loadToolGroupConfig, getDisabledTools, type ToolGroupConfig } from './config/tool-groups.ts';
 import { ORACLE_DATA_DIR, DB_PATH, REPO_ROOT } from './config.ts';
 import { MCP_SERVER_NAME } from './const.ts';
+import { buildMcpToolCatalog } from './tools/catalog.ts';
+import { dispatchMcpTool } from './tools/dispatch.ts';
+import { decideToolCall, filterToolCatalog } from './tools/write-policy.ts';
 
-// Tool handlers (all extracted to src/tools/)
 import type { ToolContext } from './tools/types.ts';
-import {
-  searchToolDef, handleSearch,
-  learnToolDef, handleLearn,
-  listToolDef, handleList,
-  statsToolDef, handleStats,
-  conceptsToolDef, handleConcepts,
-  supersedeToolDef, handleSupersede,
-  handoffToolDef, handleHandoff,
-  inboxToolDef, handleInbox,
-  readToolDef, handleRead,
-  forumToolDefs,
-  handleThread, handleThreads, handleThreadRead, handleThreadUpdate,
-  traceToolDefs,
-  handleTrace, handleTraceList, handleTraceGet, handleTraceLink, handleTraceUnlink, handleTraceChain,
-  reflectToolDef, handleReflect,
-  verifyToolDef, handleVerify,
-  scheduleAddToolDef, scheduleListToolDef, handleScheduleAdd, handleScheduleList,
-} from './tools/index.ts';
-
-import type {
-  OracleSearchInput,
-  OracleLearnInput,
-  OracleListInput,
-  OracleStatsInput,
-  OracleConceptsInput,
-  OracleSupersededInput,
-  OracleHandoffInput,
-  OracleInboxInput,
-  OracleReadInput,
-  OracleThreadInput,
-  OracleThreadsInput,
-  OracleThreadReadInput,
-  OracleThreadUpdateInput,
-  OracleReflectInput,
-  OracleVerifyInput,
-  OracleScheduleAddInput,
-  OracleScheduleListInput,
-} from './tools/index.ts';
-
-import type {
-  CreateTraceInput,
-  ListTracesInput,
-  GetTraceInput,
-} from './trace/types.ts';
-
-// Write tools that should be disabled in read-only mode
-const WRITE_TOOLS = [
-  'arra_learn',
-  'arra_thread',
-  'arra_thread_update',
-  'arra_trace',
-  'arra_supersede',
-  'arra_handoff',
-  'arra_schedule_add',
-];
 
 class OracleMCPServer {
   private server: Server;
@@ -110,12 +60,7 @@ class OracleMCPServer {
       console.error(`[ToolGroups] Disabled: ${disabledGroups.join(', ')}`);
     }
 
-    this.vectorStore = createVectorStore({
-      type: 'lancedb',
-      collectionName: 'oracle_knowledge_bge_m3',
-      embeddingProvider: 'ollama',
-      embeddingModel: 'bge-m3',
-    });
+    this.vectorStore = createVectorStore(resolveVectorStoreConfigForModel('bge-m3'));
 
     const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname || __dirname, '..', 'package.json'), 'utf-8'));
     this.version = pkg.version;
@@ -182,39 +127,9 @@ class OracleMCPServer {
     // List available tools
     // ================================================================
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const allTools = [
-        // Meta-documentation tool
-        {
-          name: '____IMPORTANT',
-          description: `ORACLE WORKFLOW GUIDE (v${this.version}):\n\n1. SEARCH & DISCOVER\n   arra_search(query) → Find knowledge by keywords/vectors\n   arra_read(file/id) → Read full document content\n   arra_list() → Browse all documents\n   arra_concepts() → See topic coverage\n\n2. LEARN & REMEMBER\n   arra_learn(pattern) → Add new patterns/learnings\n   arra_thread(message) → Multi-turn discussions\n   ⚠️ BEFORE adding: search for similar topics first!\n   If updating old info → use arra_supersede(oldId, newId)\n\n3. TRACE & DISTILL\n   arra_trace(query) → Log discovery sessions with dig points\n   arra_trace_list() → Find past traces\n   arra_trace_get(id) → Explore dig points (files, commits, issues)\n   arra_trace_link(prevId, nextId) → Chain related traces together\n   arra_trace_chain(id) → View the full linked chain\n\n4. HANDOFF & INBOX\n   arra_handoff(content) → Save session context for next session\n   arra_inbox() → List pending handoffs\n\n5. SUPERSEDE (when info changes)\n   arra_supersede(oldId, newId, reason) → Mark old doc as outdated\n   "Nothing is Deleted" — old preserved, just marked superseded\n\nPhilosophy: "Nothing is Deleted" — All interactions logged.`,
-          inputSchema: { type: 'object', properties: {} }
-        },
-        // Core tools (from src/tools/)
-        searchToolDef,
-        readToolDef,
-        learnToolDef,
-        listToolDef,
-        statsToolDef,
-        conceptsToolDef,
-        // Forum tools (from src/tools/forum.ts)
-        ...forumToolDefs,
-        // Trace tools (from src/tools/trace.ts)
-        ...traceToolDefs,
-        // Supersede, Handoff, Inbox
-        supersedeToolDef,
-        handoffToolDef,
-        inboxToolDef,
-        // Reflect, Verify, Schedule
-        reflectToolDef,
-        verifyToolDef,
-        scheduleAddToolDef,
-        scheduleListToolDef,
-      ];
-
-      let tools = allTools.filter(t => !this.disabledTools.has(t.name));
-      if (this.readOnly) {
-        tools = tools.filter(t => !WRITE_TOOLS.includes(t.name));
-      }
+      const configuredTools = buildMcpToolCatalog(this.version)
+        .filter((tool) => !this.disabledTools.has(tool.name));
+      const tools = filterToolCatalog(configuredTools, this.readOnly);
 
       return { tools };
     });
@@ -233,80 +148,27 @@ class OracleMCPServer {
         };
       }
 
-      if (this.readOnly && WRITE_TOOLS.includes(request.params.name)) {
+      const args = request.params.arguments as unknown;
+      const decision = decideToolCall(request.params.name, args, this.readOnly);
+      if (!decision.allowed) {
         return {
           content: [{
             type: 'text',
-            text: `Error: Tool "${request.params.name}" is disabled in read-only mode. This Oracle instance is configured for read-only access.`
+            text: `Error: ${decision.error}`
           }],
           isError: true
         };
       }
 
-      const ctx = this.toolCtx;
+      const ctx = { ...this.toolCtx, telemetryEnabled: decision.telemetryEnabled };
 
       try {
-        switch (request.params.name) {
-          // Core tools (delegated to src/tools/)
-          case '____IMPORTANT':
-            return {
-              content: [{ type: 'text', text: this.version ? `ORACLE WORKFLOW GUIDE (v${this.version})` : 'Oracle MCP Server' }],
-            };
-          case 'arra_search':
-            return await handleSearch(ctx, request.params.arguments as unknown as OracleSearchInput);
-          case 'arra_read':
-            return await handleRead(ctx, request.params.arguments as unknown as OracleReadInput);
-          case 'arra_learn':
-            return await handleLearn(ctx, request.params.arguments as unknown as OracleLearnInput);
-          case 'arra_list':
-            return await handleList(ctx, request.params.arguments as unknown as OracleListInput);
-          case 'arra_stats':
-            return await handleStats(ctx, request.params.arguments as unknown as OracleStatsInput);
-          case 'arra_concepts':
-            return await handleConcepts(ctx, request.params.arguments as unknown as OracleConceptsInput);
-          case 'arra_supersede':
-            return await handleSupersede(ctx, request.params.arguments as unknown as OracleSupersededInput);
-          case 'arra_handoff':
-            return await handleHandoff(ctx, request.params.arguments as unknown as OracleHandoffInput);
-          case 'arra_inbox':
-            return await handleInbox(ctx, request.params.arguments as unknown as OracleInboxInput);
-          // Forum tools (delegated to src/tools/forum.ts)
-          case 'arra_thread':
-            return await handleThread(request.params.arguments as unknown as OracleThreadInput);
-          case 'arra_threads':
-            return await handleThreads(request.params.arguments as unknown as OracleThreadsInput);
-          case 'arra_thread_read':
-            return await handleThreadRead(request.params.arguments as unknown as OracleThreadReadInput);
-          case 'arra_thread_update':
-            return await handleThreadUpdate(request.params.arguments as unknown as OracleThreadUpdateInput);
-
-          // Trace tools (delegated to src/tools/trace.ts)
-          case 'arra_trace':
-            return await handleTrace(request.params.arguments as unknown as CreateTraceInput);
-          case 'arra_trace_list':
-            return await handleTraceList(request.params.arguments as unknown as ListTracesInput);
-          case 'arra_trace_get':
-            return await handleTraceGet(request.params.arguments as unknown as GetTraceInput);
-          case 'arra_trace_link':
-            return await handleTraceLink(request.params.arguments as unknown as { prevTraceId: string; nextTraceId: string });
-          case 'arra_trace_unlink':
-            return await handleTraceUnlink(request.params.arguments as unknown as { traceId: string; direction: 'prev' | 'next' });
-          case 'arra_trace_chain':
-            return await handleTraceChain(request.params.arguments as unknown as { traceId: string });
-
-          // Reflect, Verify, Schedule tools
-          case 'arra_reflect':
-            return await handleReflect(ctx, request.params.arguments as unknown as OracleReflectInput);
-          case 'arra_verify':
-            return await handleVerify(ctx, request.params.arguments as unknown as OracleVerifyInput);
-          case 'arra_schedule_add':
-            return await handleScheduleAdd(ctx, request.params.arguments as unknown as OracleScheduleAddInput);
-          case 'arra_schedule_list':
-            return await handleScheduleList(ctx, request.params.arguments as unknown as OracleScheduleListInput);
-
-          default:
-            throw new Error(`Unknown tool: ${request.params.name}`);
-        }
+        return await dispatchMcpTool(
+          request.params.name,
+          request.params.arguments,
+          ctx,
+          this.version,
+        );
       } catch (error) {
         return {
           content: [{

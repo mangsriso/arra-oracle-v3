@@ -1,10 +1,7 @@
 /** Canonical plugin scanner shared between /api/plugins and
  * /api/plugins/:name. Two layouts side-by-side:
  *   1. Nested: ~/.oracle/plugins/<name>/plugin.json + <wasm-from-manifest>
- *   2. Flat:   ~/.oracle/plugins/<name>.wasm
- *
- * Logic is identical to src/routes/plugins.ts (the Hono twin, scheduled for
- * removal once the Elysia migration wires up). During transition both exist. */
+ *   2. Flat:   ~/.oracle/plugins/<name>.wasm */
 import { t, type Static } from 'elysia';
 import { readdirSync, statSync, readFileSync, existsSync } from 'fs';
 import { join, basename } from 'path';

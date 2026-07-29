@@ -32,6 +32,7 @@ export async function handleVerify(ctx: ToolContext, input: OracleVerifyInput): 
   const { check = true, type } = input;
 
   const result = verifyKnowledgeBase({
+    sqlite: ctx.sqlite,
     check,
     type,
     repoRoot: ctx.repoRoot,
@@ -48,6 +49,11 @@ export async function handleVerify(ctx: ToolContext, input: OracleVerifyInput): 
         orphaned: result.orphaned,
         drifted: result.drifted,
         untracked: result.untracked,
+        excluded: result.excluded,
+        preserved: result.preserved,
+        resolved_collisions: result.resolvedCollisions,
+        mtime_only: result.mtimeOnly,
+        details: result.details,
         recommendation: result.recommendation,
         ...(result.fixedOrphans ? { fixed_orphans: result.fixedOrphans } : {}),
       }, null, 2)

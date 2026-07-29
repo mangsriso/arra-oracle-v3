@@ -21,6 +21,13 @@ export async function storeDocuments(
   documents: OracleDocument[]
 ): Promise<void> {
   const now = Date.now();
+  const uniqueIds = new Set(documents.map(document => document.id));
+  if (uniqueIds.size !== documents.length) {
+    throw new Error(
+      `Refusing to store ${documents.length - uniqueIds.size} duplicate document ID(s); `
+      + 'run resolveDocumentIdCollisions before storage',
+    );
+  }
 
   // Prepare FTS statements. FTS5 virtual tables have no UNIQUE constraint on
   // the id column (it's UNINDEXED), so INSERT OR REPLACE doesn't dedupe —

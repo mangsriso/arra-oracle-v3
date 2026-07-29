@@ -1,16 +1,52 @@
 /**
- * Oracle Verify Handler
+ * Read-only knowledge index verification.
  *
- * Compares ψ/ files on disk vs DB index.
- * Detects: healthy, missing, orphaned, drifted, untracked files.
- *
- * Philosophy: "Nothing is Deleted" — orphans are flagged, not removed.
+ * The indexer's contract is parser output ↔ SQLite metadata/FTS content.
+ * Filesystem mtime is diagnostic only: checkout/copy operations can change it
+ * without changing knowledge. Non-indexer and superseded rows are reported
+ * separately so preserved history is not mislabeled as actionable drift.
  */
 
-import fs from 'fs';
-import path from 'path';
-import { eq } from 'drizzle-orm';
-import { db, oracleDocuments } from '../db/index.ts';
+import type { Database } from 'bun:sqlite';
+import fs from 'node:fs';
+import path from 'node:path';
+import type { OracleDocument } from '../types.ts';
+import { discoverProjectPsiDirs } from '../indexer/discovery.ts';
+import { getAllMarkdownFiles } from '../indexer/collectors.ts';
+import {
+  parseLearningFile,
+  parseResonanceFile,
+  parseRetroFile,
+} from '../indexer/parser.ts';
+import {
+  resolveDocumentIdCollisions,
+  type ResolvedDocumentIdCollision,
+} from '../indexer/document-ids.ts';
+
+const CATEGORIES = ['resonance', 'learnings', 'retrospectives'] as const;
+type Category = (typeof CATEGORIES)[number];
+
+interface DbDocument {
+  id: string;
+  type: string;
+  sourceFile: string;
+  concepts: string;
+  indexedAt: number;
+  createdBy: string | null;
+  supersededBy: string | null;
+}
+
+interface FtsDocument {
+  id: string;
+  content: string;
+  concepts: string;
+}
+
+export interface VerifyDetail {
+  path: string;
+  reason: string;
+  ids?: string[];
+}
 
 export interface VerifyResult {
   counts: {
@@ -19,225 +55,325 @@ export interface VerifyResult {
     orphaned: number;
     drifted: number;
     untracked: number;
+    excluded: number;
+    preserved: number;
+    collisions: number;
+    actionable: number;
   };
   missing: string[];
   orphaned: string[];
   drifted: string[];
   untracked: string[];
+  excluded: VerifyDetail[];
+  preserved: VerifyDetail[];
+  resolvedCollisions: ResolvedDocumentIdCollision[];
+  mtimeOnly: string[];
+  details: {
+    missing: VerifyDetail[];
+    orphaned: VerifyDetail[];
+    drifted: VerifyDetail[];
+  };
   recommendation: string;
   fixedOrphans?: number;
 }
 
-interface FileInfo {
-  relativePath: string;
-  mtimeMs: number;
+interface SourceInventory {
+  documents: OracleDocument[];
+  allIndexableFiles: Set<string>;
+  excluded: VerifyDetail[];
+  untracked: string[];
+  mtimes: Map<string, number>;
 }
 
-/**
- * Recursively collect all .md files with mtimes
- */
-function walkMarkdownFiles(dir: string, baseDir: string): FileInfo[] {
-  const files: FileInfo[] = [];
-  if (!fs.existsSync(dir)) return files;
+function relativeMarkdownFiles(directory: string, repoRoot: string): string[] {
+  if (!fs.existsSync(directory)) return [];
+  return getAllMarkdownFiles(directory).map(file => path.relative(repoRoot, file));
+}
 
-  const items = fs.readdirSync(dir);
-  for (const item of items) {
-    const fullPath = path.join(dir, item);
-    const stat = fs.statSync(fullPath);
-    if (stat.isDirectory()) {
-      files.push(...walkMarkdownFiles(fullPath, baseDir));
-    } else if (item.endsWith('.md')) {
-      files.push({
-        relativePath: path.relative(baseDir, fullPath),
-        mtimeMs: stat.mtimeMs,
-      });
+function parseFile(category: Category, relativePath: string, content: string): OracleDocument[] {
+  if (category === 'resonance') {
+    return parseResonanceFile(relativePath, content, relativePath);
+  }
+  if (category === 'learnings') {
+    return parseLearningFile(relativePath, content, relativePath);
+  }
+  return parseRetroFile(relativePath, content);
+}
+
+function inventorySources(repoRoot: string): SourceInventory {
+  const documents: OracleDocument[] = [];
+  const allIndexableFiles = new Set<string>();
+  const excluded: VerifyDetail[] = [];
+  const mtimes = new Map<string, number>();
+  const seenProjectContentHashes = new Set<string>();
+  const projectPsiDirs = discoverProjectPsiDirs(repoRoot, { quiet: true });
+
+  for (const category of CATEGORIES) {
+    const rootDirectory = path.join(repoRoot, 'ψ', 'memory', category);
+    for (const relativePath of relativeMarkdownFiles(rootDirectory, repoRoot)) {
+      allIndexableFiles.add(relativePath);
+      const fullPath = path.join(repoRoot, relativePath);
+      mtimes.set(relativePath, fs.statSync(fullPath).mtimeMs);
+      const parsed = parseFile(category, relativePath, fs.readFileSync(fullPath, 'utf8'));
+      if (parsed.length === 0) {
+        excluded.push({ path: relativePath, reason: 'no-indexable-sections' });
+      } else {
+        documents.push(...parsed);
+      }
+    }
+
+    for (const psiDir of projectPsiDirs) {
+      const projectDirectory = path.join(psiDir, 'memory', category);
+      for (const relativePath of relativeMarkdownFiles(projectDirectory, repoRoot)) {
+        allIndexableFiles.add(relativePath);
+        const fullPath = path.join(repoRoot, relativePath);
+        mtimes.set(relativePath, fs.statSync(fullPath).mtimeMs);
+        const content = fs.readFileSync(fullPath, 'utf8');
+        const contentHash = Bun.hash(content).toString(36);
+        if (seenProjectContentHashes.has(contentHash)) {
+          excluded.push({ path: relativePath, reason: 'duplicate-project-content' });
+          continue;
+        }
+        seenProjectContentHashes.add(contentHash);
+        const parsed = parseFile(category, relativePath, content);
+        if (parsed.length === 0) {
+          excluded.push({ path: relativePath, reason: 'no-indexable-sections' });
+        } else {
+          documents.push(...parsed);
+        }
+      }
     }
   }
-  return files;
+
+  // _universal is a vault/sync layout, not an OracleIndexer input. The old
+  // verifier scanned it anyway and produced 216 false "drifted" files.
+  for (const category of CATEGORIES) {
+    const directory = path.join(repoRoot, '_universal', 'ψ', 'memory', category);
+    for (const relativePath of relativeMarkdownFiles(directory, repoRoot)) {
+      excluded.push({ path: relativePath, reason: 'universal-mirror-not-indexed' });
+    }
+  }
+
+  const untracked = relativeMarkdownFiles(path.join(repoRoot, 'ψ', 'inbox'), repoRoot);
+  return { documents, allIndexableFiles, excluded, untracked, mtimes };
 }
 
-/**
- * Verify knowledge base integrity: disk files vs DB index
- */
+function loadDbDocuments(sqlite: Database, type?: string): DbDocument[] {
+  const columns = new Set(
+    (sqlite.query('PRAGMA table_info(oracle_documents)').all() as Array<{ name: string }>)
+      .map(column => column.name),
+  );
+  const createdBy = columns.has('created_by') ? 'created_by' : 'NULL';
+  const supersededBy = columns.has('superseded_by') ? 'superseded_by' : 'NULL';
+  const params: string[] = [];
+  let where = '';
+  if (type && type !== 'all') {
+    where = 'WHERE type = ?';
+    params.push(type);
+  }
+  return sqlite.query(`
+    SELECT id, type, source_file AS sourceFile, concepts,
+           indexed_at AS indexedAt, ${createdBy} AS createdBy,
+           ${supersededBy} AS supersededBy
+    FROM oracle_documents
+    ${where}
+  `).all(...params) as DbDocument[];
+}
+
+function loadFtsDocuments(sqlite: Database): Map<string, FtsDocument[]> {
+  const rows = sqlite.query('SELECT id, content, concepts FROM oracle_fts').all() as FtsDocument[];
+  const byId = new Map<string, FtsDocument[]>();
+  for (const row of rows) {
+    const group = byId.get(row.id) || [];
+    group.push(row);
+    byId.set(row.id, group);
+  }
+  return byId;
+}
+
+function addBySource<T extends { sourceFile: string }>(rows: T[]): Map<string, T[]> {
+  const result = new Map<string, T[]>();
+  for (const row of rows) {
+    const group = result.get(row.sourceFile) || [];
+    group.push(row);
+    result.set(row.sourceFile, group);
+  }
+  return result;
+}
+
+function conceptsEqual(expected: string[], actual: string): boolean {
+  try {
+    return JSON.stringify(expected) === JSON.stringify(JSON.parse(actual));
+  } catch {
+    return false;
+  }
+}
+
+function uniqueDetails(details: VerifyDetail[]): VerifyDetail[] {
+  const seen = new Set<string>();
+  return details.filter(detail => {
+    const key = `${detail.path}\0${detail.reason}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 export function verifyKnowledgeBase(opts: {
+  sqlite: Database;
   check?: boolean;
   type?: string;
   repoRoot: string;
 }): VerifyResult {
-  const { check = true, type, repoRoot } = opts;
+  const { sqlite, check = true, type, repoRoot } = opts;
+  const inventory = inventorySources(repoRoot);
+  const dbRows = loadDbDocuments(sqlite, type);
+  const indexRows = dbRows.filter(row => row.createdBy === 'indexer' || row.createdBy === null);
+  const durableRows = dbRows.filter(row => row.createdBy !== 'indexer' && row.createdBy !== null);
+  const indexById = new Map(indexRows.map(row => [row.id, row]));
+  const indexBySource = addBySource(indexRows);
+  const durableBySource = addBySource(durableRows);
+  const ftsById = loadFtsDocuments(sqlite);
+  const expectedDocuments = type && type !== 'all'
+    ? inventory.documents.filter(document => document.type === type)
+    : inventory.documents;
 
-  // 1. Walk indexed directories on disk
-  //    - vault-relative: ψ/memory/* (direct vault files)
-  //    - project-prefixed: github.com/*/ψ/memory/* (cross-project files from indexer)
-  const indexedDirs = ['ψ/memory/resonance', 'ψ/memory/learnings', 'ψ/memory/retrospectives'];
-  const diskFiles = new Map<string, number>(); // relativePath -> mtimeMs
-
-  // Walk vault-relative paths
-  for (const dir of indexedDirs) {
-    const fullDir = path.join(repoRoot, dir);
-    const files = walkMarkdownFiles(fullDir, repoRoot);
-    for (const f of files) {
-      diskFiles.set(f.relativePath, f.mtimeMs);
-    }
+  const resolved = resolveDocumentIdCollisions(
+    expectedDocuments,
+    new Map(indexRows.map(row => [row.id, row.sourceFile])),
+  );
+  const expectedBySource = new Map<string, OracleDocument[]>();
+  for (const document of resolved.documents) {
+    const group = expectedBySource.get(document.source_file) || [];
+    group.push(document);
+    expectedBySource.set(document.source_file, group);
   }
 
-  // Walk project-prefixed paths: github.com/*/ψ/memory/*
-  const ghDir = path.join(repoRoot, 'github.com');
-  if (fs.existsSync(ghDir)) {
-    const orgs = fs.readdirSync(ghDir);
-    for (const org of orgs) {
-      const orgDir = path.join(ghDir, org);
-      if (!fs.statSync(orgDir).isDirectory()) continue;
-      const repos = fs.readdirSync(orgDir);
-      for (const repo of repos) {
-        const repoDir = path.join(orgDir, repo);
-        if (!fs.statSync(repoDir).isDirectory()) continue;
-        for (const subDir of ['ψ/memory/resonance', 'ψ/memory/learnings', 'ψ/memory/retrospectives']) {
-          const fullDir = path.join(repoDir, subDir);
-          if (fs.existsSync(fullDir)) {
-            const files = walkMarkdownFiles(fullDir, repoRoot);
-            for (const f of files) {
-              diskFiles.set(f.relativePath, f.mtimeMs);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Walk universal paths: _universal/ψ/memory/*
-  const universalDir = path.join(repoRoot, '_universal');
-  if (fs.existsSync(universalDir)) {
-    for (const subDir of ['ψ/memory/resonance', 'ψ/memory/learnings', 'ψ/memory/retrospectives']) {
-      const fullDir = path.join(universalDir, subDir);
-      if (fs.existsSync(fullDir)) {
-        const files = walkMarkdownFiles(fullDir, repoRoot);
-        for (const f of files) {
-          diskFiles.set(f.relativePath, f.mtimeMs);
-        }
-      }
-    }
-  }
-
-  // 2. Query DB for all indexed documents
-  const typeFilter = type && type !== 'all' ? type : undefined;
-  const dbRows = typeFilter
-    ? db.select({
-        id: oracleDocuments.id,
-        sourceFile: oracleDocuments.sourceFile,
-        indexedAt: oracleDocuments.indexedAt,
-        type: oracleDocuments.type,
-      })
-        .from(oracleDocuments)
-        .where(eq(oracleDocuments.type, typeFilter))
-        .all()
-    : db.select({
-        id: oracleDocuments.id,
-        sourceFile: oracleDocuments.sourceFile,
-        indexedAt: oracleDocuments.indexedAt,
-        type: oracleDocuments.type,
-      })
-        .from(oracleDocuments)
-        .all();
-
-  // Build map: sourceFile -> { indexedAt, ids[] }
-  // Multiple DB entries can point to the same source file (chunked docs)
-  const dbFileMap = new Map<string, { indexedAt: number; ids: string[] }>();
-  for (const row of dbRows) {
-    const existing = dbFileMap.get(row.sourceFile);
-    if (existing) {
-      existing.ids.push(row.id);
-      // Use the latest indexedAt
-      if (row.indexedAt > existing.indexedAt) {
-        existing.indexedAt = row.indexedAt;
-      }
-    } else {
-      dbFileMap.set(row.sourceFile, { indexedAt: row.indexedAt, ids: [row.id] });
-    }
-  }
-
-  // 3. Classify
   const healthy: string[] = [];
-  const missing: string[] = [];
-  const drifted: string[] = [];
-  const orphaned: string[] = [];
+  const missingDetails: VerifyDetail[] = [];
+  const driftedDetails: VerifyDetail[] = [];
+  const orphanedDetails: VerifyDetail[] = [];
+  const preserved: VerifyDetail[] = [];
+  const excluded = [...inventory.excluded];
+  const mtimeOnly: string[] = [];
 
-  // Check each file on disk
-  for (const [relPath, mtimeMs] of diskFiles) {
-    const dbEntry = dbFileMap.get(relPath);
-    if (!dbEntry) {
-      // File on disk, not in DB
-      missing.push(relPath);
+  for (const [sourceFile, expectedDocuments] of expectedBySource) {
+    const actualRows = indexBySource.get(sourceFile) || [];
+    if (actualRows.length === 0) {
+      missingDetails.push({
+        path: sourceFile,
+        reason: 'no-indexer-row',
+        ids: expectedDocuments.map(document => document.id),
+      });
+      continue;
+    }
+
+    const expectedIds = new Set(expectedDocuments.map(document => document.id));
+    const actualIds = new Set(actualRows.map(row => row.id));
+    const reasons: string[] = [];
+    const missingIds = [...expectedIds].filter(id => !actualIds.has(id));
+    const staleIds = [...actualIds].filter(id => !expectedIds.has(id));
+    if (missingIds.length > 0) reasons.push(`missing-ids:${missingIds.length}`);
+    if (staleIds.length > 0) reasons.push(`stale-ids:${staleIds.length}`);
+
+    for (const document of expectedDocuments) {
+      const row = indexById.get(document.id);
+      if (!row || row.sourceFile !== sourceFile) continue;
+      if (row.type !== document.type) reasons.push(`type:${document.id}`);
+      if (!conceptsEqual(document.concepts, row.concepts)) reasons.push(`concepts:${document.id}`);
+      const ftsRows = ftsById.get(document.id) || [];
+      if (ftsRows.length !== 1) {
+        reasons.push(`fts-cardinality:${document.id}:${ftsRows.length}`);
+      } else if (
+        ftsRows[0].content !== document.content
+        || ftsRows[0].concepts !== document.concepts.join(' ')
+      ) {
+        reasons.push(`fts-content:${document.id}`);
+      }
+    }
+
+    if (reasons.length > 0) {
+      driftedDetails.push({ path: sourceFile, reason: reasons.join(','), ids: [...expectedIds] });
+      continue;
+    }
+
+    healthy.push(sourceFile);
+    const latestIndexedAt = Math.max(...actualRows.map(row => Number(row.indexedAt)));
+    if ((inventory.mtimes.get(sourceFile) || 0) > latestIndexedAt) {
+      mtimeOnly.push(sourceFile);
+    }
+  }
+
+  // Indexer rows whose files are outside the current parser output are either
+  // stale (file still in index scope), out-of-scope history, or true orphans.
+  for (const [sourceFile, rows] of indexBySource) {
+    if (expectedBySource.has(sourceFile)) continue;
+    if (inventory.allIndexableFiles.has(sourceFile)) {
+      driftedDetails.push({
+        path: sourceFile,
+        reason: 'indexer-rows-for-excluded-or-empty-file',
+        ids: rows.map(row => row.id),
+      });
+    } else if (fs.existsSync(path.join(repoRoot, sourceFile))) {
+      excluded.push({ path: sourceFile, reason: 'db-source-outside-indexer-scope' });
     } else {
-      // File exists in both — check drift
-      if (mtimeMs > dbEntry.indexedAt) {
-        drifted.push(relPath);
-      } else {
-        healthy.push(relPath);
-      }
+      orphanedDetails.push({
+        path: sourceFile,
+        reason: 'indexer-source-missing-from-disk',
+        ids: rows.map(row => row.id),
+      });
     }
   }
 
-  // Check each DB entry for orphans (in DB, not on disk)
-  const seenDbFiles = new Set<string>();
-  for (const [sourceFile] of dbFileMap) {
-    if (seenDbFiles.has(sourceFile)) continue;
-    seenDbFiles.add(sourceFile);
-
-    if (!diskFiles.has(sourceFile)) {
-      orphaned.push(sourceFile);
+  // arra_learn/manual rows are durable records, not indexer output. Missing
+  // superseded files are expected history under "Nothing is Deleted".
+  for (const [sourceFile, rows] of durableBySource) {
+    if (expectedBySource.has(sourceFile) || inventory.allIndexableFiles.has(sourceFile)) continue;
+    if (fs.existsSync(path.join(repoRoot, sourceFile))) {
+      excluded.push({ path: sourceFile, reason: 'durable-source-outside-indexer-scope' });
+    } else if (rows.every(row => row.supersededBy !== null)) {
+      preserved.push({
+        path: sourceFile,
+        reason: 'superseded-durable-history',
+        ids: rows.map(row => row.id),
+      });
+    } else {
+      orphanedDetails.push({
+        path: sourceFile,
+        reason: 'unsuperseded-durable-source-missing',
+        ids: rows.map(row => row.id),
+      });
     }
   }
 
-  // 4. Count untracked files (ψ/inbox/, ψ/learn/, etc. — outside indexed dirs)
-  const untrackedDirs = ['ψ/inbox'];
-  const untracked: string[] = [];
-  for (const dir of untrackedDirs) {
-    const fullDir = path.join(repoRoot, dir);
-    const files = walkMarkdownFiles(fullDir, repoRoot);
-    for (const f of files) {
-      untracked.push(f.relativePath);
-    }
-  }
+  const missing = uniqueDetails(missingDetails);
+  const drifted = uniqueDetails(driftedDetails);
+  const orphaned = uniqueDetails(orphanedDetails);
+  const finalExcluded = uniqueDetails(excluded);
+  const finalPreserved = uniqueDetails(preserved);
 
-  // 5. Auto-fix orphans if check=false
   let fixedOrphans = 0;
-  if (!check && orphaned.length > 0) {
+  if (!check) {
+    const update = sqlite.prepare(`
+      UPDATE oracle_documents
+      SET superseded_by = '_verified_orphan',
+          superseded_at = ?,
+          superseded_reason = 'File missing from disk (arra_verify)'
+      WHERE id = ? AND superseded_by IS NULL
+    `);
     const now = Date.now();
-    for (const sourceFile of orphaned) {
-      const entry = dbFileMap.get(sourceFile);
-      if (entry) {
-        for (const id of entry.ids) {
-          db.update(oracleDocuments)
-            .set({
-              supersededBy: '_verified_orphan',
-              supersededAt: now,
-              supersededReason: 'File missing from disk (arra_verify)',
-            })
-            .where(eq(oracleDocuments.id, id))
-            .run();
-          fixedOrphans++;
-        }
+    for (const detail of orphaned) {
+      for (const id of detail.ids || []) {
+        fixedOrphans += Number(update.run(now, id).changes);
       }
     }
   }
 
-  // 6. Build recommendation
-  const issues = missing.length + orphaned.length + drifted.length;
-  let recommendation = '';
-  if (issues === 0) {
-    recommendation = 'Knowledge base is healthy. All files match DB index.';
-  } else {
-    const parts: string[] = [];
-    if (missing.length > 0) parts.push(`${missing.length} missing from index`);
-    if (orphaned.length > 0) parts.push(`${orphaned.length} orphaned in DB`);
-    if (drifted.length > 0) parts.push(`${drifted.length} drifted since last index`);
-    recommendation = `Run \`bun run index\` to fix ${issues} issues (${parts.join(', ')})`;
-  }
-
-  if (fixedOrphans > 0) {
-    recommendation += `. Flagged ${fixedOrphans} orphaned entries as '_verified_orphan'.`;
-  }
+  const actionable = missing.length + orphaned.length + drifted.length;
+  const recommendation = actionable === 0
+    ? 'Knowledge file index is healthy. Vector parity is a separate invariant.'
+    : `Run \`bun run index\` after review to reconcile ${actionable} file issue(s), `
+      + 'then run the model backfill separately to restore documents == vectors.';
 
   return {
     counts: {
@@ -245,12 +381,21 @@ export function verifyKnowledgeBase(opts: {
       missing: missing.length,
       orphaned: orphaned.length,
       drifted: drifted.length,
-      untracked: untracked.length,
+      untracked: inventory.untracked.length,
+      excluded: finalExcluded.length,
+      preserved: finalPreserved.length,
+      collisions: new Set(resolved.collisions.map(item => item.remappedSource)).size,
+      actionable,
     },
-    missing,
-    orphaned,
-    drifted,
-    untracked,
+    missing: missing.map(detail => detail.path),
+    orphaned: orphaned.map(detail => detail.path),
+    drifted: drifted.map(detail => detail.path),
+    untracked: inventory.untracked,
+    excluded: finalExcluded,
+    preserved: finalPreserved,
+    resolvedCollisions: resolved.collisions,
+    mtimeOnly,
+    details: { missing, orphaned, drifted },
     recommendation,
     ...(fixedOrphans > 0 ? { fixedOrphans } : {}),
   };

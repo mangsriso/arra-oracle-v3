@@ -25,6 +25,7 @@ import {
   EMBEDDING_MODELS,
 } from '../vector/factory.ts';
 import type { VectorStoreAdapter } from '../vector/types.ts';
+import { isStringArray, parseRecordJson } from '../vector/safe-json.ts';
 import type { SearchResult } from './types.ts';
 
 /** Convenience wrapper used by every handler in this file. */
@@ -350,7 +351,13 @@ export async function handleMap3d(model?: string): Promise<{
         docLookup.set(row.id, {
           type: row.type,
           sourceFile: row.sourceFile,
-          concepts: row.concepts ? JSON.parse(row.concepts) : [],
+          concepts: parseRecordJson(
+            row.concepts,
+            [],
+            'sqlite.concepts',
+            row.id,
+            isStringArray,
+          ),
           project: row.project || null,
           createdAt: row.createdAt,
         });
@@ -608,12 +615,21 @@ export async function handleMap3d(model?: string): Promise<{
  * Uses getStats() which returns the count from each engine's collection.
  */
 export async function handleVectorStats(): Promise<{
-  vector: { enabled: boolean; count: number; collection: string };
-  vectors?: Array<{ key: string; model: string; collection: string; count: number; enabled: boolean }>;
+  vector: {
+    enabled: boolean; count: number; collection: string;
+    version?: number; refreshed_at?: string;
+  };
+  vectors?: Array<{
+    key: string; model: string; collection: string; count: number; enabled: boolean;
+    version?: number; refreshed_at?: string;
+  }>;
 }> {
   const timeout = parseInt(process.env.ORACLE_CHROMA_TIMEOUT || '5000', 10);
   const models = getEmbeddingModels();
-  const engines: Array<{ key: string; model: string; collection: string; count: number; enabled: boolean }> = [];
+  const engines: Array<{
+    key: string; model: string; collection: string; count: number; enabled: boolean;
+    version?: number; refreshed_at?: string;
+  }> = [];
 
   // Query all registered engines in parallel
   await Promise.all(
@@ -626,7 +642,12 @@ export async function handleVectorStats(): Promise<{
             setTimeout(() => reject(new Error('timeout')), timeout)
           ),
         ]);
-        engines.push({ key, model: preset.model, collection: preset.collection, count: stats.count, enabled: true });
+        engines.push({
+          key, model: preset.model, collection: preset.collection,
+          count: stats.count, enabled: true,
+          ...(stats.version !== undefined && { version: stats.version }),
+          ...(stats.refreshedAt && { refreshed_at: stats.refreshedAt }),
+        });
       } catch {
         engines.push({ key, model: preset.model, collection: preset.collection, count: 0, enabled: false });
       }
@@ -640,6 +661,8 @@ export async function handleVectorStats(): Promise<{
       enabled: primary?.enabled ?? false,
       count: primary?.count ?? 0,
       collection: primary?.collection ?? 'oracle_knowledge_bge_m3',
+      ...(primary?.version !== undefined && { version: primary.version }),
+      ...(primary?.refreshed_at && { refreshed_at: primary.refreshed_at }),
     },
     vectors: engines,
   };

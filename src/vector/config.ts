@@ -12,14 +12,22 @@ import fs from 'fs';
 import path from 'path';
 import { ORACLE_DATA_DIR, LANCEDB_DIR } from '../config.ts';
 import { COLLECTION_NAME } from '../const.ts';
+import type { EmbeddingProviderType } from './types.ts';
 
 export const VECTOR_CONFIG_FILE = 'vector-server.json';
 
 export interface VectorCollectionConfig {
   collection: string;
   model: string;
-  provider: string;
+  provider: EmbeddingProviderType;
   primary?: boolean;
+}
+
+export interface EmbeddingModelPreset {
+  collection: string;
+  model: string;
+  provider: EmbeddingProviderType;
+  dataPath?: string;
 }
 
 export interface VectorServerConfig {
@@ -100,12 +108,13 @@ export function writeVectorConfig(config: VectorServerConfig): string {
  */
 export function configToModels(
   config: VectorServerConfig,
-): Record<string, { collection: string; model: string; dataPath?: string }> {
-  const out: Record<string, { collection: string; model: string; dataPath?: string }> = {};
+): Record<string, EmbeddingModelPreset> {
+  const out: Record<string, EmbeddingModelPreset> = {};
   for (const [key, col] of Object.entries(config.collections)) {
     out[key] = {
       collection: col.collection,
       model: col.model,
+      provider: col.provider || 'ollama',
       dataPath: config.dataPath || undefined,
     };
   }

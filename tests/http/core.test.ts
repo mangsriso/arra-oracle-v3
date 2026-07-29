@@ -10,64 +10,22 @@
  * Pattern mirrors src/integration/http.test.ts (subprocess + fetch).
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import type { Subprocess } from "bun";
+import {
+  startIsolatedHttpServer,
+  type IsolatedHttpServer,
+} from "../support/isolated-http-server.ts";
 
-const BASE_URL = "http://localhost:47778";
-let serverProcess: Subprocess | null = null;
-
-async function waitForServer(maxAttempts = 30): Promise<boolean> {
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const res = await fetch(`${BASE_URL}/api/health`);
-      if (res.ok) return true;
-    } catch { /* not ready */ }
-    await Bun.sleep(500);
-  }
-  return false;
-}
-
-async function isServerRunning(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BASE_URL}/api/health`);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
+let BASE_URL = "";
+let fixture: IsolatedHttpServer | null = null;
 
 describe("HTTP Contract — Core Routes", () => {
   beforeAll(async () => {
-    if (await isServerRunning()) {
-      console.log("Using existing server");
-      return;
-    }
-    console.log("Starting server...");
-    serverProcess = Bun.spawn(["bun", "run", "src/server.ts"], {
-      cwd: import.meta.dir.replace("/tests/http", ""),
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, ORACLE_CHROMA_TIMEOUT: "3000" },
-    });
-    const ready = await waitForServer();
-    if (!ready) {
-      let stderr = "";
-      if (serverProcess.stderr) {
-        const reader = serverProcess.stderr.getReader();
-        try {
-          const { value } = await reader.read();
-          if (value) stderr = new TextDecoder().decode(value);
-        } catch { /* ignore */ }
-      }
-      throw new Error(`Server failed to start.\nstderr: ${stderr}`);
-    }
-    console.log("Server ready");
+    fixture = await startIsolatedHttpServer("oracle-core-http");
+    BASE_URL = fixture.baseUrl;
   }, 30_000);
 
-  afterAll(() => {
-    if (serverProcess) {
-      serverProcess.kill();
-      console.log("Server stopped");
-    }
+  afterAll(async () => {
+    if (fixture) await fixture.stop();
   });
 
   // ============================================================

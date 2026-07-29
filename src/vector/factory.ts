@@ -16,6 +16,8 @@ import { QdrantAdapter } from './adapters/qdrant.ts';
 import { CloudflareVectorizeAdapter, CloudflareAIEmbeddings } from './adapters/cloudflare-vectorize.ts';
 import { createEmbeddingProvider } from './embeddings.ts';
 import { loadVectorConfig, configToModels } from './config.ts';
+import type { EmbeddingModelPreset } from './config.ts';
+import { resolveEmbeddingRuntime } from './runtime-config.ts';
 
 export interface VectorStoreConfig {
   type?: VectorDBType;
@@ -132,7 +134,7 @@ export function createVectorStore(config: VectorStoreConfig = {}): VectorStoreAd
 // Model-based registry for dual-index search
 // ============================================================================
 
-export function getEmbeddingModels(): Record<string, { collection: string; model: string; dataPath?: string }> {
+export function getEmbeddingModels(): Record<string, EmbeddingModelPreset> {
   // If vector-server.json exists, use it as source of truth (#1071 phase 2)
   const cfg = loadVectorConfig();
   if (cfg) return configToModels(cfg);
@@ -142,23 +144,48 @@ export function getEmbeddingModels(): Record<string, { collection: string; model
     nomic: {
       collection: COLLECTION_NAME,
       model: 'nomic-embed-text',
+      provider: 'ollama',
       dataPath: LANCEDB_DIR,
     },
     qwen3: {
       collection: 'oracle_knowledge_qwen3',
       model: 'qwen3-embedding',
+      provider: 'ollama',
       dataPath: LANCEDB_DIR,
     },
     'bge-m3': {
       collection: 'oracle_knowledge_bge_m3',
       model: 'bge-m3',
+      provider: 'ollama',
       dataPath: LANCEDB_DIR,
     },
   };
 }
 
+/**
+ * Build the complete store config for one registry model. Keeping this
+ * resolution in one place prevents MCP, HTTP, and indexer launch paths from
+ * silently selecting different providers or models.
+ */
+export function resolveVectorStoreConfigForModel(
+  modelKey: string,
+  models: Record<string, EmbeddingModelPreset> = getEmbeddingModels(),
+  env: Record<string, string | undefined> = process.env,
+): VectorStoreConfig {
+  const preset = models[modelKey];
+  if (!preset) throw new Error(`Unknown embedding model registry key: ${modelKey}`);
+  const embedding = resolveEmbeddingRuntime(preset, env);
+  return {
+    type: 'lancedb',
+    collectionName: preset.collection,
+    embeddingProvider: embedding.provider,
+    embeddingModel: embedding.model,
+    ...(preset.dataPath && { dataPath: preset.dataPath }),
+  };
+}
+
 /** @deprecated Use getEmbeddingModels() — kept for backward compat */
-export const EMBEDDING_MODELS = new Proxy({} as Record<string, { collection: string; model: string; dataPath?: string }>, {
+export const EMBEDDING_MODELS = new Proxy({} as Record<string, EmbeddingModelPreset>, {
   get(_, prop: string) { return getEmbeddingModels()[prop]; },
   has(_, prop: string) { return prop in getEmbeddingModels(); },
   ownKeys() { return Object.keys(getEmbeddingModels()); },
@@ -173,7 +200,7 @@ const modelStoreCache = new Map<string, VectorStoreAdapter>();
 
 /**
  * Get a vector store for a specific embedding model.
- * Uses LanceDB + env-configured embedding provider (default: ollama).
+ * Uses LanceDB + deployment env overrides, falling back to the model registry.
  * Caches instances by model key.
  */
 const connectPromises = new Map<string, Promise<void>>();
@@ -183,16 +210,7 @@ export function getVectorStoreByModel(model?: string): VectorStoreAdapter {
   const key = model && models[model] ? model : 'bge-m3';
   let store = modelStoreCache.get(key);
   if (!store) {
-    const preset = models[key];
-    const provider = (process.env.ORACLE_EMBEDDING_PROVIDER as EmbeddingProviderType) || 'ollama';
-    const embeddingModel = process.env.ORACLE_EMBEDDING_MODEL || preset.model;
-    store = createVectorStore({
-      type: 'lancedb',
-      collectionName: preset.collection,
-      embeddingProvider: provider,
-      embeddingModel,
-      ...(preset.dataPath && { dataPath: preset.dataPath }),
-    });
+    store = createVectorStore(resolveVectorStoreConfigForModel(key, models));
     modelStoreCache.set(key, store);
     // Auto-connect in background (non-blocking)
     connectPromises.set(key, store.connect().catch(e =>

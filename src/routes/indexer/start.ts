@@ -4,17 +4,49 @@ import { createDatabase } from '../../db/index.ts';
 import { setIndexingStatus } from '../../indexer/status.ts';
 import { DB_PATH, REPO_ROOT } from '../../config.ts';
 import type { IndexerConfig } from '../../types.ts';
+import { resolveEmbeddingRuntime } from '../../vector/runtime-config.ts';
+import {
+  isReindexConfirmed,
+  isValidReindexBatchSize,
+  REINDEX_CONFIRMATION,
+} from '../../vector/reindex-guard.ts';
 
 let abortFlag = false;
+let indexerRunning = false;
 export function getAbortFlag() { return abortFlag; }
 export function setAbortFlag(v: boolean) { abortFlag = v; }
+export function getIndexerRunning() { return indexerRunning; }
 
-export const startEndpoint = new Elysia().post('/indexer/start', async ({ body }) => {
+export const startEndpoint = new Elysia().post('/indexer/start', async ({ body, set }) => {
+  if (!isReindexConfirmed(body.confirmation)) {
+    set.status = 400;
+    return {
+      error: 'Vector reindex requires exact destructive-operation confirmation',
+      requiredConfirmation: REINDEX_CONFIRMATION,
+    };
+  }
+  if (indexerRunning) {
+    set.status = 409;
+    return { error: 'Indexing already in progress' };
+  }
   const { model, sourcePath, batchSize } = body;
 
   const models = getEmbeddingModels();
-  const key = model && models[model] ? model : 'nomic';
+  if (model && !models[model]) {
+    set.status = 400;
+    return { error: `Unknown embedding model: ${model}` };
+  }
+  if (batchSize !== undefined && !isValidReindexBatchSize(batchSize)) {
+    set.status = 400;
+    return { error: 'batchSize must be a positive integer' };
+  }
+  const key = model ?? 'nomic';
   const preset = models[key];
+  if (!preset) {
+    set.status = 400;
+    return { error: `Default embedding model is not configured: ${key}` };
+  }
+  const embedding = resolveEmbeddingRuntime(preset);
   const batch = batchSize || (key === 'nomic' ? 100 : 50);
 
   const { db, sqlite } = createDatabase(DB_PATH);
@@ -32,12 +64,13 @@ export const startEndpoint = new Elysia().post('/indexer/start', async ({ body }
   const store = createVectorStore({
     type: 'lancedb',
     collectionName: preset.collection,
-    embeddingProvider: 'ollama',
-    embeddingModel: preset.model,
+    embeddingProvider: embedding.provider,
+    embeddingModel: embedding.model,
     ...(preset.dataPath && { dataPath: preset.dataPath }),
   });
 
   abortFlag = false;
+  indexerRunning = true;
 
   const jobId = `idx-${Date.now()}`;
 
@@ -45,7 +78,7 @@ export const startEndpoint = new Elysia().post('/indexer/start', async ({ body }
   (async () => {
     try {
       await store.connect();
-      try { await store.deleteCollection(); } catch {}
+      await store.deleteCollection();
       await store.ensureCollection();
 
       const rows = sqlite.prepare(`
@@ -87,16 +120,20 @@ export const startEndpoint = new Elysia().post('/indexer/start', async ({ body }
       if (!abortFlag) {
         setIndexingStatus(sqlite, config, false, rows.length, rows.length);
       }
-      await store.close();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setIndexingStatus(sqlite, config, false, 0, 0, msg);
+    } finally {
+      indexerRunning = false;
+      try { await store.close(); } catch {}
+      sqlite.close();
     }
   })();
 
   return { jobId, status: 'started', model: key, batchSize: batch };
 }, {
   body: t.Object({
+    confirmation: t.Optional(t.String()),
     model: t.Optional(t.String()),
     sourcePath: t.Optional(t.String()),
     batchSize: t.Optional(t.Number()),

@@ -1,15 +1,11 @@
 import { Elysia } from 'elysia';
+import { fetchOracleNet } from './client.ts';
 import { ORACLENET_URL } from './model.ts';
 
 export const statusEndpoint = new Elysia().get('/status', async () => {
-  try {
-    const res = await fetch(`${ORACLENET_URL}/api/health`, {
-      signal: AbortSignal.timeout(3000),
-    });
-    return { online: res.ok, url: ORACLENET_URL };
-  } catch {
-    return { online: false, url: ORACLENET_URL };
-  }
+  const result = await fetchOracleNet('/api/health');
+  if (result.ok) return { online: true, url: ORACLENET_URL };
+  return { online: false, url: ORACLENET_URL, reason: result.kind };
 }, {
   detail: {
     tags: ['oraclenet'],

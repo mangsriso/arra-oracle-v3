@@ -36,7 +36,3 @@ export const logsQuery = t.Object({
 export const docParams = t.Object({
   id: t.String(),
 });
-
-export const pluginParams = t.Object({
-  name: t.String(),
-});

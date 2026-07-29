@@ -9,6 +9,12 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import * as C from './const.ts';
+import { resolveOracleHost } from './server/bind.ts';
+import { assertSafeTestRuntime } from './testing/test-safety.ts';
+
+// This must run before path resolution creates ORACLE_DATA_DIR or db/index.ts
+// opens SQLite. Test subprocesses inherit strict mode from tests/preload.ts.
+assertSafeTestRuntime();
 
 // ES Module compatibility for __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -24,6 +30,7 @@ export const HOME_DIR = home;
 
 // Core paths
 export const PORT = parseInt(String(process.env.ORACLE_PORT || C.ORACLE_DEFAULT_PORT), 10);
+export const ORACLE_HOST = resolveOracleHost(process.env.ORACLE_HOST);
 export const ORACLE_DATA_DIR = process.env.ORACLE_DATA_DIR || path.join(HOME_DIR, C.ORACLE_DATA_DIR_NAME);
 export const DB_PATH = process.env.ORACLE_DB_PATH || path.join(ORACLE_DATA_DIR, C.ORACLE_DB_FILE);
 

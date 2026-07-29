@@ -11,31 +11,33 @@
  */
 
 import { spawn } from 'bun';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { buildExportOpenApiEnv, exportOpenApiPaths } from './export-openapi-env.ts';
 
 const args = parseArgs(process.argv.slice(2));
 const PORT = args.port ?? '48900';
 const OUT = resolve(args.out ?? 'docs/openapi.json');
 const BOOT_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 200;
+const PROJECT_ROOT = resolve(import.meta.dirname, '..');
+const sandbox = exportOpenApiPaths(await mkdtemp(join(tmpdir(), 'oracle-openapi-')));
 
-const child = spawn({
-  cmd: ['bun', 'src/server.ts'],
-  env: { ...process.env, ORACLE_PORT: PORT, NODE_ENV: 'development' },
-  stdout: 'pipe',
-  stderr: 'pipe',
-});
+let child: ReturnType<typeof spawn> | null = null;
 
 const shutdown = async (code: number): Promise<never> => {
   try {
-    child.kill('SIGTERM');
-    await Promise.race([
-      child.exited,
-      new Promise((r) => setTimeout(r, 3000)),
-    ]);
-    if (!child.killed) child.kill('SIGKILL');
+    if (child) {
+      child.kill('SIGTERM');
+      await Promise.race([
+        child.exited,
+        new Promise((r) => setTimeout(r, 3000)),
+      ]);
+      if (!child.killed) child.kill('SIGKILL');
+    }
   } catch {}
+  await rm(sandbox.root, { recursive: true, force: true }).catch(() => {});
   process.exit(code);
 };
 
@@ -43,6 +45,20 @@ process.on('SIGINT', () => shutdown(130));
 process.on('SIGTERM', () => shutdown(143));
 
 try {
+  await Promise.all([
+    mkdir(sandbox.home, { recursive: true }),
+    mkdir(sandbox.data, { recursive: true }),
+    mkdir(sandbox.repo, { recursive: true }),
+    mkdir(sandbox.temporary, { recursive: true }),
+  ]);
+  child = spawn({
+    cmd: [process.execPath, 'src/server.ts'],
+    cwd: PROJECT_ROOT,
+    env: buildExportOpenApiEnv(sandbox, PORT),
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+
   await waitForServer(`http://127.0.0.1:${PORT}/`, BOOT_TIMEOUT_MS);
 
   const res = await fetch(`http://127.0.0.1:${PORT}/swagger/json`);

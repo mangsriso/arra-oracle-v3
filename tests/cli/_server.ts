@@ -1,47 +1,26 @@
 /**
- * Shared server fixture — spawn src/server.ts on demand, reuse if already up.
- * Mirrors the pattern in tests/http/core.test.ts.
+ * Shared CLI server fixture. Always owns a dedicated temp server; never reuses
+ * the production endpoint or another developer process.
  */
-import type { Subprocess } from "bun";
+import {
+  startIsolatedHttpServer,
+  type IsolatedHttpServer,
+} from "../support/isolated-http-server.ts";
 
-export const BASE_URL = "http://localhost:47778";
-
-let serverProcess: Subprocess | null = null;
-
-async function isServerRunning(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BASE_URL}/api/health`);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForServer(maxAttempts = 30): Promise<boolean> {
-  for (let i = 0; i < maxAttempts; i++) {
-    if (await isServerRunning()) return true;
-    await Bun.sleep(500);
-  }
-  return false;
-}
-
-const REPO_ROOT = new URL("../../", import.meta.url).pathname.replace(/\/$/, "");
+export let BASE_URL = "http://127.0.0.1:9";
+let fixture: IsolatedHttpServer | null = null;
 
 export async function ensureServer(): Promise<void> {
-  if (await isServerRunning()) return;
-  serverProcess = Bun.spawn(["bun", "run", "src/server.ts"], {
-    cwd: REPO_ROOT,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, ORACLE_CHROMA_TIMEOUT: "3000" },
-  });
-  const ready = await waitForServer();
-  if (!ready) throw new Error("Server failed to start for tests/cli/");
+  if (fixture) return;
+  fixture = await startIsolatedHttpServer("oracle-cli-http");
+  BASE_URL = fixture.baseUrl;
+  process.env.ORACLE_API = BASE_URL;
 }
 
-export function stopServer(): void {
-  if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
-  }
+export async function stopServer(): Promise<void> {
+  if (!fixture) return;
+  await fixture.stop();
+  fixture = null;
+  BASE_URL = "http://127.0.0.1:9";
+  process.env.ORACLE_API = BASE_URL;
 }
