@@ -7,79 +7,74 @@
  *   bun src/scripts/index-model.ts bge-m3
  *   bun src/scripts/index-model.ts qwen3
  *   bun src/scripts/index-model.ts nomic
+ *   bun src/scripts/index-model.ts bge-m3 --rebuild
  */
 
-import { createVectorStore, EMBEDDING_MODELS } from '../vector/factory.ts';
-import { createDatabase, oracleDocuments } from '../db/index.ts';
-import { count } from 'drizzle-orm';
+import { Database } from 'bun:sqlite';
+import { createVectorStore, getEmbeddingModels } from '../vector/factory.ts';
+import { loadVectorConfig } from '../vector/config.ts';
+import { resolveEmbeddingRuntime } from '../vector/runtime-config.ts';
 import { DB_PATH } from '../config.ts';
+import {
+  hasConfiguredEmbeddingProvider,
+  runIncrementalBackfill,
+  supportsIncrementalBackfill,
+} from './index-model-backfill.ts';
 
-const modelKey = process.argv[2];
-
-if (!modelKey || !EMBEDDING_MODELS[modelKey]) {
-  console.error(`Usage: bun src/scripts/index-model.ts <model>`);
-  console.error(`Available models: ${Object.keys(EMBEDDING_MODELS).join(', ')}`);
-  process.exit(1);
+function parseArguments(models: Record<string, unknown>): { modelKey: string; rebuild: boolean } {
+  const args = process.argv.slice(2);
+  const unknownFlags = args.filter(arg => arg.startsWith('--') && arg !== '--rebuild');
+  const modelKeys = args.filter(arg => !arg.startsWith('--'));
+  const modelKey = modelKeys[0];
+  if (unknownFlags.length > 0 || modelKeys.length !== 1 || !models[modelKey]) {
+    console.error('Usage: bun src/scripts/index-model.ts <model> [--rebuild]');
+    console.error(`Available models: ${Object.keys(models).join(', ')}`);
+    if (unknownFlags.length > 0) console.error(`Unknown option: ${unknownFlags.join(', ')}`);
+    throw new Error('Invalid indexer arguments');
+  }
+  return { modelKey, rebuild: args.includes('--rebuild') };
 }
 
-const preset = EMBEDDING_MODELS[modelKey];
-
-// Larger models get smaller batches to avoid OOM / timeouts
-const BATCH_SIZE = modelKey === 'nomic' ? 100 : 50;
-
 async function main() {
+  const models = getEmbeddingModels();
+  const { modelKey, rebuild } = parseArguments(models);
+  const preset = models[modelKey];
+  const embedding = resolveEmbeddingRuntime(preset);
+  const vectorConfig = loadVectorConfig();
+  const batchSize = modelKey === 'nomic' ? 100 : 50;
+
   console.log(`=== ${modelKey} Indexer ===`);
   console.log(`DB: ${DB_PATH}`);
   console.log(`Collection: ${preset.collection}`);
-  console.log(`Model: ${preset.model}`);
-  console.log(`Batch size: ${BATCH_SIZE}`);
+  console.log(`Provider: ${embedding.provider}`);
+  console.log(`Model: ${embedding.model}`);
+  console.log(`Batch size: ${batchSize}`);
 
-  // Use Drizzle for structured queries, raw sqlite only for FTS5 joins
-  const { db, sqlite } = createDatabase(DB_PATH);
-  const [{ total: docCount }] = db.select({ total: count() }).from(oracleDocuments).all();
-  console.log(`Documents: ${docCount}`);
+  const sqlite = new Database(DB_PATH, { readonly: true });
+  try {
+    const sqliteIds = (sqlite.prepare(
+      'SELECT id FROM oracle_documents ORDER BY id',
+    ).all() as Array<{ id: string }>).map(row => row.id);
+    console.log(`Documents: ${sqliteIds.length}`);
 
-  const store = createVectorStore({
-    type: 'lancedb',
-    collectionName: preset.collection,
-    embeddingProvider: (process.env.ORACLE_EMBEDDING_PROVIDER as any) || 'ollama',
-    embeddingModel: process.env.ORACLE_EMBEDDING_MODEL || preset.model,
-    ...(preset.dataPath && { dataPath: preset.dataPath }),
-  });
+    // FTS5 join requires raw SQL — Drizzle doesn't support virtual tables.
+    const rows = sqlite.prepare(`
+      SELECT d.id, d.type, GROUP_CONCAT(f.content, '\n') as content,
+             d.source_file, d.concepts, d.project
+      FROM oracle_documents d
+      JOIN oracle_fts f ON d.id = f.id
+      GROUP BY d.id
+      ORDER BY d.created_at DESC
+    `).all() as Array<{
+      id: string;
+      type: string;
+      content: string;
+      source_file: string;
+      concepts: string;
+      project: string | null;
+    }>;
 
-  await store.connect();
-
-  // Fresh index
-  try { await store.deleteCollection(); } catch {}
-  await store.ensureCollection();
-
-  // FTS5 join requires raw SQL — Drizzle doesn't support virtual tables
-  const rows = sqlite.prepare(`
-    SELECT d.id, d.type, GROUP_CONCAT(f.content, '\n') as content, d.source_file, d.concepts, d.project, d.created_at
-    FROM oracle_documents d
-    JOIN oracle_fts f ON d.id = f.id
-    GROUP BY d.id
-    ORDER BY d.created_at DESC
-  `).all() as Array<{
-    id: string;
-    type: string;
-    content: string;
-    source_file: string;
-    concepts: string;
-    project: string | null;
-    created_at: string;
-  }>;
-
-  const totalBatches = Math.ceil(rows.length / BATCH_SIZE);
-  let indexed = 0;
-  let errors = 0;
-  const startTime = Date.now();
-
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const batch = rows.slice(i, i + BATCH_SIZE);
-    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-
-    const docs = batch.map(row => ({
+    const sourceDocuments = rows.map(row => ({
       id: row.id,
       document: row.content,
       metadata: {
@@ -90,33 +85,38 @@ async function main() {
       },
     }));
 
-    try {
-      await store.addDocuments(docs);
-      indexed += docs.length;
-
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-      const rate = (indexed / Number(elapsed)).toFixed(1);
-      const eta = ((rows.length - indexed) / Number(rate)).toFixed(0);
-      console.log(`  Batch ${batchNum}/${totalBatches} — ${indexed}/${rows.length} docs — ${rate}/s — ETA ${eta}s`);
-    } catch (e) {
-      errors++;
-      console.error(`  Batch ${batchNum} FAILED:`, e instanceof Error ? e.message : String(e));
+    const store = createVectorStore({
+      type: 'lancedb',
+      collectionName: preset.collection,
+      embeddingProvider: embedding.provider,
+      embeddingModel: embedding.model,
+      ...(preset.dataPath && { dataPath: preset.dataPath }),
+    });
+    if (!supportsIncrementalBackfill(store)) {
+      throw new Error('Selected vector adapter does not support incremental backfill');
     }
+
+    await runIncrementalBackfill({
+      store,
+      sourceDocuments,
+      sqliteIds,
+      modelKey,
+      batchSize,
+      providerConfigured: hasConfiguredEmbeddingProvider(
+        modelKey,
+        process.env,
+        vectorConfig,
+      ),
+      rebuild,
+    });
+  } finally {
+    sqlite.close();
   }
-
-  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-  const stats = await store.getStats();
-
-  console.log('\n=== Done ===');
-  console.log(`Indexed: ${stats.count} docs`);
-  console.log(`Errors: ${errors} batches`);
-  console.log(`Time: ${totalTime}s`);
-
-  await store.close();
-  sqlite.close();
 }
 
-main().catch(e => {
-  console.error('Indexer failed:', e);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch(error => {
+    console.error('Indexer failed:', error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

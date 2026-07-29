@@ -5,7 +5,13 @@
  * Uses EmbeddingProvider since LanceDB doesn't generate embeddings.
  */
 
-import type { VectorStoreAdapter, VectorDocument, VectorQueryResult, EmbeddingProvider } from '../types.ts';
+import type {
+  VectorStoreAdapter,
+  VectorDocument,
+  VectorQueryResult,
+  EmbeddingProvider,
+  StoredDocumentText,
+} from '../types.ts';
 import { isJsonObject, parseRecordJson } from '../safe-json.ts';
 
 export class LanceDBAdapter implements VectorStoreAdapter {
@@ -75,10 +81,7 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     }
   }
 
-  async addDocuments(docs: VectorDocument[]): Promise<void> {
-    if (docs.length === 0) return;
-    if (!this.table) await this.ensureCollection();
-
+  private async rowsForDocuments(docs: VectorDocument[]) {
     // Embed only the docs that lack a precomputed vector. Callers that
     // already have a vector (e.g. the indexer worker loop, where embed
     // happens before the storage write) skip the second Ollama round-trip.
@@ -93,20 +96,50 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     }
     let freshIdx = 0;
 
-    const rows = docs.map((doc) => ({
-      id: doc.id,
-      text: doc.document,
-      metadata: JSON.stringify(doc.metadata),
-      vector: doc.vector ?? fresh[freshIdx++],
-    }));
+    return {
+      rows: docs.map((doc) => ({
+        id: doc.id,
+        text: doc.document,
+        metadata: JSON.stringify(doc.metadata),
+        vector: doc.vector ?? fresh[freshIdx++],
+      })),
+      reused: docs.length - needEmbed.length,
+    };
+  }
 
+  async addDocuments(docs: VectorDocument[]): Promise<void> {
+    if (docs.length === 0) return;
+    if (!this.table) await this.ensureCollection();
+
+    const { rows, reused } = await this.rowsForDocuments(docs);
     await this.table.add(rows);
-    const reused = docs.length - needEmbed.length;
     if (reused > 0) {
       console.log(`[LanceDB] Added ${docs.length} documents (${reused} with precomputed vectors)`);
     } else {
       console.log(`[LanceDB] Added ${docs.length} documents`);
     }
+  }
+
+  async upsertDocuments(docs: VectorDocument[]): Promise<void> {
+    if (docs.length === 0) return;
+    if (!this.table) await this.ensureCollection();
+
+    const { rows } = await this.rowsForDocuments(docs);
+    await this.table.mergeInsert('id')
+      .whenMatchedUpdateAll()
+      .whenNotMatchedInsertAll()
+      .execute(rows);
+    console.log(`[LanceDB] Upserted ${docs.length} documents`);
+  }
+
+  async getDocumentTexts(): Promise<StoredDocumentText[]> {
+    if (!this.table) await this.ensureCollection();
+
+    const rows = await this.table.query().select(['id', 'text']).toArray();
+    return rows.map((row: { id: unknown; text: unknown }) => ({
+      id: String(row.id),
+      text: String(row.text ?? ''),
+    }));
   }
 
   async query(text: string, limit: number = 10, where?: Record<string, any>): Promise<VectorQueryResult> {

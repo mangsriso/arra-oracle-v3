@@ -29,6 +29,11 @@ export interface VectorQueryResult {
   metadatas: any[];
 }
 
+export interface StoredDocumentText {
+  id: string;
+  text: string;
+}
+
 /**
  * Pluggable vector store interface.
  * Any vector DB (ChromaDB, sqlite-vec, Qdrant, LanceDB) implements this.
@@ -40,6 +45,10 @@ export interface VectorStoreAdapter {
   ensureCollection(): Promise<void>;
   deleteCollection(): Promise<void>;
   addDocuments(docs: VectorDocument[]): Promise<void>;
+  /** Optional idempotent write path for adapters that support keyed upserts. */
+  upsertDocuments?(docs: VectorDocument[]): Promise<void>;
+  /** Read stored identity/text without materializing vectors. */
+  getDocumentTexts?(): Promise<StoredDocumentText[]>;
   query(text: string, limit?: number, where?: Record<string, any>): Promise<VectorQueryResult>;
   queryById(id: string, nResults?: number): Promise<VectorQueryResult>;
   getStats(): Promise<{ count: number }>;
