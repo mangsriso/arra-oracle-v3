@@ -45,7 +45,7 @@ Exposes tools to Claude via Model Context Protocol:
 
 | Tool | Purpose | Logs To |
 |------|---------|---------|
-| `oracle_search` | Hybrid keyword + semantic search | (none yet) |
+| `arra_search` | Hybrid keyword + semantic search | `search_log` + process console |
 | `oracle_consult` | Get guidance on decisions | `consult_log` |
 | `oracle_reflect` | Random principle/learning | - |
 | `oracle_learn` | Add new pattern | writes file + indexes |
@@ -154,18 +154,23 @@ CREATE TABLE indexing_status (
 
 ### Current Logging
 
-| Event | Destination | Data |
-|-------|-------------|------|
+| Event / surface | Persistent destination | Behavior |
+|-----------------|------------------------|----------|
+| HTTP search (`GET /api/search`) | `search_log` + `document_access` tables | `logSearch()` also writes search details to the process console; one access row is recorded per returned document |
+| MCP search (`arra_search`) | `search_log` table only | When telemetry is enabled, `logSearch()` also writes search details to the process console; MCP search does not write `document_access` |
+| Explicit feed event (`POST /api/feed`) | `feed.log` | Appends the submitted feed event |
 | Consultations | `consult_log` table | decision, context, counts, guidance |
+| Learning capture | `learn_log` table | document ID, pattern preview, source, concepts |
 | ChromaDB status | stderr | connection state |
 | Indexing progress | `indexing_status` table | progress, errors |
 | FTS5 errors | stderr | query, error message |
 
-### Logging Gaps
+### Logging Boundaries
 
-- No search query tracking (`oracle_search` calls)
-- No learning history (when/what was learned)
-- No document access tracking (which docs referenced)
+- Search telemetry and feed events are separate: neither HTTP nor MCP search
+  appends `feed.log`.
+- The explicit `POST /api/feed` handler is the only source path that appends
+  `feed.log`.
 - No HTTP endpoint access logs
 
 ## Configuration
