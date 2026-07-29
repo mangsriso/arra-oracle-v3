@@ -8,11 +8,11 @@ import {
 
 export const statusRoute = new Elysia().get('/status', ({ server, request, cookie }) => {
   const sessionValue = cookie[SESSION_COOKIE_NAME]?.value as string | undefined;
+  const isLocal = isLocalNetwork(server, request);
   try {
     const authEnabled = getSetting('auth_enabled') === 'true';
     const hasPassword = !!getSetting('auth_password_hash');
     const localBypass = getSetting('auth_local_bypass') !== 'false';
-    const isLocal = isLocalNetwork(server, request);
     const authenticated = isAuthenticated(server, request, sessionValue);
 
     return { authenticated, authEnabled, hasPassword, localBypass, isLocal };
@@ -23,7 +23,7 @@ export const statusRoute = new Elysia().get('/status', ({ server, request, cooki
         authEnabled: false,
         hasPassword: false,
         localBypass: true,
-        isLocal: true,
+        isLocal,
         indexing: true,
       };
     }

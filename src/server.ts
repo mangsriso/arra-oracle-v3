@@ -18,9 +18,9 @@ import {
   performGracefulShutdown,
 } from './process-manager/index.ts';
 
-import { PORT, ORACLE_DATA_DIR, VECTOR_URL } from './config.ts';
+import { PORT, ORACLE_HOST, ORACLE_DATA_DIR, VECTOR_URL } from './config.ts';
 import { MCP_SERVER_NAME } from './const.ts';
-import { db, sqlite, closeDb, indexingStatus } from './db/index.ts';
+import { db, sqlite, closeDb, getSetting, indexingStatus } from './db/index.ts';
 import { seedMenuItems, type HasRoutes as SeedHasRoutes } from './db/seeders/menu-seeder.ts';
 
 // Elysia sub-apps — one per cluster
@@ -44,6 +44,7 @@ import { vaultRoutes } from './routes/vault/index.ts';
 import { indexerRoutes } from './routes/indexer/index.ts';
 import { createMenuRoutes } from './routes/menu/index.ts';
 import { mcpRoutes } from './routes/mcp/index.ts';
+import { createAuthorizationGuard } from './routes/auth/authorization.ts';
 import { gatewayPlugin } from './gateway/index.ts';
 
 import pkg from '../package.json' with { type: 'json' };
@@ -148,6 +149,12 @@ const app = new Elysia()
       methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     }),
   )
+  .use(createAuthorizationGuard({
+    getAuthState: () => ({
+      authEnabled: getSetting('auth_enabled') === 'true',
+      localBypass: getSetting('auth_local_bypass') !== 'false',
+    }),
+  }))
   .onAfterHandle(({ set }) => {
     set.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate';
     set.headers['X-Content-Type-Options'] = 'nosniff';
@@ -237,5 +244,6 @@ console.log(`
 
 export default {
   port: Number(PORT),
+  hostname: ORACLE_HOST,
   fetch: app.fetch,
 };
