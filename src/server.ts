@@ -245,5 +245,13 @@ console.log(`
 export default {
   port: Number(PORT),
   hostname: ORACLE_HOST,
-  fetch: app.fetch,
+  // Elysia only populates ctx.server inside app.listen(). This module uses
+  // Bun's default-export form instead, so ctx.server stayed null and the
+  // authorization guard — which fails closed on an unresolvable peer — 401'd
+  // every request, including the loopback /mcp/* calls index-http.ts depends
+  // on. Handing Elysia the server explicitly restores requestIP().
+  fetch(request: Request, server: unknown) {
+    (app as { server?: unknown }).server = server;
+    return app.fetch(request);
+  },
 };
