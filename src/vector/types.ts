@@ -34,6 +34,13 @@ export interface StoredDocumentText {
   text: string;
 }
 
+export interface VectorStoreStats {
+  count: number;
+  /** Storage-native revision observed after refreshing the read handle. */
+  version?: number;
+  refreshedAt?: string;
+}
+
 /**
  * Pluggable vector store interface.
  * Any vector DB (ChromaDB, sqlite-vec, Qdrant, LanceDB) implements this.
@@ -51,7 +58,7 @@ export interface VectorStoreAdapter {
   getDocumentTexts?(): Promise<StoredDocumentText[]>;
   query(text: string, limit?: number, where?: Record<string, any>): Promise<VectorQueryResult>;
   queryById(id: string, nResults?: number): Promise<VectorQueryResult>;
-  getStats(): Promise<{ count: number }>;
+  getStats(): Promise<VectorStoreStats>;
   getCollectionInfo(): Promise<{ count: number; name: string }>;
   getAllEmbeddings?(limit?: number): Promise<{ ids: string[]; embeddings: number[][]; metadatas: any[] }>;
 }

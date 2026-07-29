@@ -46,3 +46,15 @@ must still protect these endpoints. Before a confirmed rebuild, verify the
 database backup, collection target, provider/model identity, and registry data
 path. A missing or incorrect confirmation must not open a database, create an
 embedding provider, start a background job, or touch a collection.
+
+## External writer visibility
+
+The server shares one LanceDB adapter per model, but another process may append
+or upsert rows through the same on-disk collection. Every adapter read checks
+out the latest table manifest before counting or querying, so a completed
+backfill becomes visible on the next API/search request without a restart.
+
+`GET /api/vector/stats` reports `version` and `refreshed_at` for each local
+LanceDB engine. A successful external write should advance the version and the
+next stats request should return the new row count. These fields are omitted
+for vector backends that do not expose a native revision.

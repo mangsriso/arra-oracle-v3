@@ -28,13 +28,21 @@ const TIMEOUT_MS = 15_000;
 const HEALTH_TIMEOUT_MS = 5_000;
 
 export interface VectorStatsResponse {
-  vector: { enabled: boolean; count: number; collection: string };
+  vector: {
+    enabled: boolean;
+    count: number;
+    collection: string;
+    version?: number;
+    refreshed_at?: string;
+  };
   vectors?: Array<{
     key: string;
     model: string;
     collection: string;
     count: number;
     enabled: boolean;
+    version?: number;
+    refreshed_at?: string;
   }>;
 }
 
