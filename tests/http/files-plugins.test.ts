@@ -9,6 +9,12 @@ import { join } from 'path';
 const WASM_HEADER = Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 
 let tmp: string;
+const originalEnv = {
+  HOME: process.env.HOME,
+  ORACLE_DATA_DIR: process.env.ORACLE_DATA_DIR,
+  ORACLE_REPO_ROOT: process.env.ORACLE_REPO_ROOT,
+  GHQ_ROOT: process.env.GHQ_ROOT,
+};
 // Mirrors production order: files first, then the canonical plugins router.
 let combined: any;
 
@@ -64,6 +70,10 @@ beforeAll(async () => {
 const req = (path: string) => new Request(`http://localhost${path}`);
 
 afterAll(() => {
+  for (const [name, value] of Object.entries(originalEnv)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
   if (tmp) rmSync(tmp, { recursive: true, force: true });
 });
 

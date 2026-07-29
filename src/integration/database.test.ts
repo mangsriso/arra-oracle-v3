@@ -9,13 +9,17 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import { eq, isNull, sql } from "drizzle-orm";
 import { existsSync, mkdirSync, rmSync, readFileSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { tmpdir } from "os";
 
 // Import schema
 import * as schema from "../db/schema";
 
 // Test database (separate from production)
-const TEST_DB_PATH = join(homedir(), ".oracle", "test-integration.db");
+const TEST_DB_DIR = join(
+  process.env.ORACLE_TEST_ROOT || tmpdir(),
+  "database-integration",
+);
+const TEST_DB_PATH = join(TEST_DB_DIR, "test-integration.db");
 const PROJECT_ROOT = join(import.meta.dir, "../..");
 
 let sqlite: Database;
@@ -24,9 +28,8 @@ let db: ReturnType<typeof drizzle>;
 describe("Database Integration (Drizzle ORM)", () => {
   beforeAll(async () => {
     // Ensure directory exists
-    const dir = join(homedir(), ".oracle");
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
+    if (!existsSync(TEST_DB_DIR)) {
+      mkdirSync(TEST_DB_DIR, { recursive: true });
     }
 
     // Create fresh test database
@@ -79,7 +82,7 @@ describe("Database Integration (Drizzle ORM)", () => {
   });
 
   afterAll(() => {
-    sqlite.close();
+    sqlite?.close();
     // Clean up test database
     if (existsSync(TEST_DB_PATH)) {
       rmSync(TEST_DB_PATH);

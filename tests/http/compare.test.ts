@@ -7,21 +7,15 @@
  * Pattern mirrors tests/http/knowledge.test.ts (subprocess + fetch).
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import type { Subprocess } from "bun";
-import path from "path";
+import {
+  startIsolatedHttpServer,
+  type IsolatedHttpServer,
+} from "../support/isolated-http-server.ts";
 
-const BASE_URL = "http://localhost:47778";
+let BASE_URL = "";
 const SEED_TAG = `compare-http-test-${Date.now()}`;
 const JSON_HEADERS = { "Content-Type": "application/json" };
-let serverProcess: Subprocess | null = null;
-
-const isUp = async () => {
-  try { return (await fetch(`${BASE_URL}/api/health`)).ok; } catch { return false; }
-};
-const waitUp = async (n = 30) => {
-  for (let i = 0; i < n; i++) { if (await isUp()) return true; await Bun.sleep(500); }
-  return false;
-};
+let fixture: IsolatedHttpServer | null = null;
 const post = (url: string, body: unknown) =>
   fetch(`${BASE_URL}${url}`, { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) });
 
@@ -33,18 +27,13 @@ async function seedLearn(pattern: string, concepts: string[] = []) {
 
 describe("HTTP Contract — GET /api/compare", () => {
   beforeAll(async () => {
-    if (await isUp()) return;
-    serverProcess = Bun.spawn(["bun", "run", "src/server.ts"], {
-      cwd: path.resolve(import.meta.dir, "../.."),
-      stdout: "pipe", stderr: "pipe",
-      env: { ...process.env, ORACLE_CHROMA_TIMEOUT: "3000" },
-    });
-    if (!(await waitUp())) throw new Error("Server failed to start within 15s");
+    fixture = await startIsolatedHttpServer("oracle-compare-http");
+    BASE_URL = fixture.baseUrl;
     // Best-effort seed so some model columns have real results
     try { await seedLearn(`${SEED_TAG} — alpha about compare endpoint`); } catch { /* ignore */ }
     try { await seedLearn(`${SEED_TAG} — beta on compare agreement`); } catch { /* ignore */ }
   }, 60_000);
-  afterAll(() => { if (serverProcess) serverProcess.kill(); });
+  afterAll(async () => { if (fixture) await fixture.stop(); });
 
   test("rejects missing query param", async () => {
     const res = await fetch(`${BASE_URL}/api/compare`);

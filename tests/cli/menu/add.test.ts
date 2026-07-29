@@ -12,7 +12,7 @@ describe("arra-cli menu add", () => {
   beforeAll(async () => { await ensureServer(); }, 30_000);
   afterAll(async () => {
     await cleanup(TEST_PATH);
-    stopServer();
+    await stopServer();
   });
 
   test("missing flags → non-zero with usage", async () => {

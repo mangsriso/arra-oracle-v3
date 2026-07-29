@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FeedEvent } from '../model.ts';
-import { activeOracles, readLocalFeed } from '../reader.ts';
+import { activeOracles, readLocalFeed, readLocalFeedTail } from '../reader.ts';
 
 let fixtureDir = '';
 
@@ -74,5 +74,25 @@ describe('streamed local feed reader', () => {
     ];
 
     expect(activeOracles(limited, now)).toEqual(['wednesday', 'fester']);
+  });
+
+  test('bounds tail reads and labels an incomplete total honestly', async () => {
+    const file = makeFixture(10_000);
+    const result = await readLocalFeedTail(file, 1, {}, 512);
+
+    expect(result.scannedBytes).toBeLessThanOrEqual(512);
+    expect(result.truncated).toBe(true);
+    expect(result.totalExact).toBe(false);
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].session_id).toBe('s-9999');
+  });
+
+  test('keeps an exact total for files inside the read budget', async () => {
+    const file = makeFixture(20);
+    const result = await readLocalFeedTail(file, 2, {}, 64 * 1024);
+
+    expect(result.total).toBe(20);
+    expect(result.totalExact).toBe(true);
+    expect(result.truncated).toBe(false);
   });
 });

@@ -162,6 +162,28 @@ export function getEmbeddingModels(): Record<string, EmbeddingModelPreset> {
   };
 }
 
+/**
+ * Build the complete store config for one registry model. Keeping this
+ * resolution in one place prevents MCP, HTTP, and indexer launch paths from
+ * silently selecting different providers or models.
+ */
+export function resolveVectorStoreConfigForModel(
+  modelKey: string,
+  models: Record<string, EmbeddingModelPreset> = getEmbeddingModels(),
+  env: Record<string, string | undefined> = process.env,
+): VectorStoreConfig {
+  const preset = models[modelKey];
+  if (!preset) throw new Error(`Unknown embedding model registry key: ${modelKey}`);
+  const embedding = resolveEmbeddingRuntime(preset, env);
+  return {
+    type: 'lancedb',
+    collectionName: preset.collection,
+    embeddingProvider: embedding.provider,
+    embeddingModel: embedding.model,
+    ...(preset.dataPath && { dataPath: preset.dataPath }),
+  };
+}
+
 /** @deprecated Use getEmbeddingModels() — kept for backward compat */
 export const EMBEDDING_MODELS = new Proxy({} as Record<string, EmbeddingModelPreset>, {
   get(_, prop: string) { return getEmbeddingModels()[prop]; },
@@ -188,15 +210,7 @@ export function getVectorStoreByModel(model?: string): VectorStoreAdapter {
   const key = model && models[model] ? model : 'bge-m3';
   let store = modelStoreCache.get(key);
   if (!store) {
-    const preset = models[key];
-    const embedding = resolveEmbeddingRuntime(preset);
-    store = createVectorStore({
-      type: 'lancedb',
-      collectionName: preset.collection,
-      embeddingProvider: embedding.provider,
-      embeddingModel: embedding.model,
-      ...(preset.dataPath && { dataPath: preset.dataPath }),
-    });
+    store = createVectorStore(resolveVectorStoreConfigForModel(key, models));
     modelStoreCache.set(key, store);
     // Auto-connect in background (non-blocking)
     connectPromises.set(key, store.connect().catch(e =>

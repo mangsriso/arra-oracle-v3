@@ -39,6 +39,7 @@ describe('unified backup retention', () => {
     expect(_backupFamilyForTest('oracle.db.checkpoint-1')).toBe('oracle.db.checkpoint');
     expect(_backupFamilyForTest('lancedb.backup-1')).toBe('lancedb.backup');
     expect(_backupFamilyForTest('pre-fix-1')).toBe('pre-fix');
+    expect(_backupFamilyForTest('oracle.db.pre-fix-1')).toBe('oracle.db.pre-fix');
     expect(_backupFamilyForTest('oracle.db')).toBeNull();
   });
 
@@ -52,6 +53,7 @@ describe('unified backup retention', () => {
       ['oracle.db.checkpoint-old', 'oracle.db.checkpoint-new'],
       ['lancedb.backup-old', 'lancedb.backup-new', true],
       ['pre-fix-old', 'pre-fix-new', true],
+      ['oracle.db.pre-fix-old', 'oracle.db.pre-fix-new'],
     ];
     for (const [oldName, newName, directory] of families) {
       artifact(oldName, 1_000, directory);
@@ -109,5 +111,45 @@ describe('unified backup retention', () => {
     artifact('oracle.db.backup-old', 1_000);
     expect(() => rotateBackupFamilies(dataDir, { keep: -1, trashDir })).toThrow();
     expect(fs.existsSync(path.join(dataDir, 'oracle.db.backup-old'))).toBe(true);
+  });
+
+  it('rotates legacy backups/pre-index snapshots as their own family', () => {
+    const legacyDir = path.join(dataDir, 'backups');
+    fs.mkdirSync(legacyDir);
+    for (const [name, mtime] of [['pre-index-old', 1_000], ['pre-index-new', 2_000]] as const) {
+      const snapshot = path.join(legacyDir, name);
+      fs.mkdirSync(snapshot);
+      fs.writeFileSync(path.join(snapshot, 'oracle.db'), name);
+      fs.utimesSync(snapshot, new Date(mtime), new Date(mtime));
+    }
+
+    const moves = rotateBackupFamilies(dataDir, { keep: 1, trashDir });
+
+    expect(moves.some(move => move.family === 'backups/pre-index'
+      && path.basename(move.source) === 'pre-index-old')).toBe(true);
+    expect(fs.existsSync(path.join(legacyDir, 'pre-index-new'))).toBe(true);
+  });
+
+  it('normalizes retained artifact files to 0600 and directories to 0700', () => {
+    const snapshot = path.join(dataDir, 'lancedb.backup-only');
+    fs.mkdirSync(snapshot, { mode: 0o775 });
+    const nested = path.join(snapshot, 'data.bin');
+    fs.writeFileSync(nested, 'fixture', { mode: 0o664 });
+
+    expect(rotateBackupFamilies(dataDir, { keep: 1, trashDir })).toEqual([]);
+    expect(fs.statSync(snapshot).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(nested).mode & 0o777).toBe(0o600);
+  });
+
+  it('does not follow a legacy backups symlink', () => {
+    const outside = path.join(root, 'outside');
+    const snapshot = path.join(outside, 'pre-index-only');
+    fs.mkdirSync(snapshot, { recursive: true, mode: 0o775 });
+    const originalMode = fs.statSync(snapshot).mode & 0o777;
+    fs.symlinkSync(outside, path.join(dataDir, 'backups'));
+
+    expect(rotateBackupFamilies(dataDir, { keep: 0, trashDir })).toEqual([]);
+    expect(fs.existsSync(snapshot)).toBe(true);
+    expect(fs.statSync(snapshot).mode & 0o777).toBe(originalMode);
   });
 });

@@ -25,6 +25,7 @@ import { setIndexingStatus } from './status.ts';
 import { backupDatabase } from './backup.ts';
 import { parseResonanceFile, parseLearningFile, parseRetroFile } from './parser.ts';
 import { collectDocuments } from './collectors.ts';
+import { resolveDocumentIdCollisions } from './document-ids.ts';
 import { storeDocuments } from './storage.ts';
 
 export class OracleIndexer {
@@ -71,7 +72,7 @@ export class OracleIndexer {
 
     // Collect documents from all source types
     const shared = { config: this.config, seenContentHashes: this.seenContentHashes };
-    const documents: OracleDocument[] = [
+    const collectedDocuments: OracleDocument[] = [
       ...collectDocuments({ ...shared, subdir: 'resonance', parseFn: parseResonanceFile, label: 'resonance' }),
       ...collectDocuments({ ...shared, subdir: 'learnings', parseFn: parseLearningFile, label: 'learning' }),
       ...collectDocuments({ ...shared, subdir: 'retrospectives', parseFn: parseRetroFile, label: 'retrospective' }),
@@ -79,21 +80,34 @@ export class OracleIndexer {
 
     // Safety: if we found zero source documents but the DB has existing
     // indexer-created content, abort rather than smart-deleting everything.
-    if (documents.length === 0 && existingIndexerDocCount > 0) {
+    if (collectedDocuments.length === 0 && existingIndexerDocCount > 0) {
       throw new Error(
         `Refusing to index: found 0 source documents but DB has ${existingIndexerDocCount} indexer docs. ` +
         `Check that ψ/memory/ contains .md files and ORACLE_REPO_ROOT points to the correct location.`
       );
     }
 
-    // Smart deletion: remove indexer-created docs whose source file no longer exists
+    // Resolve legacy basename collisions before reconciliation. Keep the ID
+    // currently owned in SQLite stable; remap only the sources it used to hide.
     const allIndexerDocs = this.db.select({ id: oracleDocuments.id, sourceFile: oracleDocuments.sourceFile })
       .from(oracleDocuments)
       .where(or(eq(oracleDocuments.createdBy, 'indexer'), isNull(oracleDocuments.createdBy)))
       .all();
+    const resolved = resolveDocumentIdCollisions(
+      collectedDocuments,
+      new Map(allIndexerDocs.map(document => [document.id, document.sourceFile])),
+    );
+    const documents = resolved.documents;
+    const expectedIds = new Set(documents.map(document => document.id));
+    if (resolved.collisions.length > 0) {
+      console.log(`Resolved ${resolved.collisions.length} cross-source document ID collisions`);
+    }
 
+    // Smart reconciliation: remove indexer rows no longer emitted by the
+    // current files/parser. Source-exists-only cleanup left stale chunks and
+    // could never repair parser changes or cross-source ID collisions.
     const idsToDelete = allIndexerDocs
-      .filter(d => !fs.existsSync(path.join(this.config.repoRoot, d.sourceFile)))
+      .filter(d => !expectedIds.has(d.id))
       .map(d => d.id);
 
     // Safety: if smart-delete would drop more than half of existing indexer
@@ -113,7 +127,7 @@ export class OracleIndexer {
       );
     }
 
-    console.log(`Smart delete: ${idsToDelete.length} stale docs (preserving arra_learn)`);
+    console.log(`Smart reconcile: ${idsToDelete.length} stale docs (preserving arra_learn)`);
 
     if (idsToDelete.length > 0) {
       this.db.delete(oracleDocuments).where(inArray(oracleDocuments.id, idsToDelete)).run();

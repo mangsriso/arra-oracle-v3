@@ -52,7 +52,7 @@ try {
     mkdir(sandbox.temporary, { recursive: true }),
   ]);
   child = spawn({
-    cmd: ['bun', 'src/server.ts'],
+    cmd: [process.execPath, 'src/server.ts'],
     cwd: PROJECT_ROOT,
     env: buildExportOpenApiEnv(sandbox, PORT),
     stdout: 'pipe',

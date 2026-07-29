@@ -1,29 +1,16 @@
 // HTTP contract tests for auth / settings / feed.
 // Isolated port + temp data dir so auth state does not leak between runs.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import type { Subprocess } from "bun";
-import fs from "fs";
-import os from "os";
-import path from "path";
+import {
+  startIsolatedHttpServer,
+  type IsolatedHttpServer,
+} from "../support/isolated-http-server.ts";
 
-const PORT = 47787;
-const BASE_URL = `http://localhost:${PORT}`;
+let BASE_URL = "";
 const PASSWORD = "contract-test-pw";
 
-let serverProcess: Subprocess | null = null;
-let dataDir = "";
+let fixture: IsolatedHttpServer | null = null;
 let sessionCookie = "";
-
-async function waitForServer(maxAttempts = 30): Promise<boolean> {
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const res = await fetch(`${BASE_URL}/api/health`);
-      if (res.ok) return true;
-    } catch { /* not ready */ }
-    await Bun.sleep(500);
-  }
-  return false;
-}
 
 function extractCookie(res: Response): string {
   const raw = res.headers.get("set-cookie") || "";
@@ -40,28 +27,12 @@ async function json(path: string, init: RequestInit = {}): Promise<Response> {
 
 describe("HTTP contract: auth / settings / feed", () => {
   beforeAll(async () => {
-    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "oracle-http-test-"));
-    const cwd = import.meta.dir.replace(/\/tests\/http$/, "");
-    serverProcess = Bun.spawn(["bun", "run", "src/server.ts"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...process.env,
-        ORACLE_PORT: String(PORT),
-        ORACLE_DATA_DIR: dataDir,
-        ORACLE_CHROMA_TIMEOUT: "3000",
-      },
-    });
-    const ready = await waitForServer();
-    if (!ready) throw new Error(`Server failed to start on ${PORT}`);
+    fixture = await startIsolatedHttpServer("oracle-auth-http");
+    BASE_URL = fixture.baseUrl;
   }, 30_000);
 
-  afterAll(() => {
-    if (serverProcess) serverProcess.kill();
-    if (dataDir && fs.existsSync(dataDir)) {
-      fs.rmSync(dataDir, { recursive: true, force: true });
-    }
+  afterAll(async () => {
+    if (fixture) await fixture.stop();
   });
 
   describe("GET /api/auth/status", () => {

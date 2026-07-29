@@ -81,17 +81,28 @@ function tombstonePath(
 }
 
 function inspectLock(lockPath: string, runtime: LockRuntime): LockDecision {
-  let raw: string;
-  let mtimeMs: number;
-  let inode: number;
+  let stat: fs.Stats;
   try {
-    const stat = fs.lstatSync(lockPath);
-    raw = fs.readFileSync(ownerPath(lockPath, stat.isDirectory()), 'utf8');
-    mtimeMs = stat.mtimeMs;
-    inode = stat.ino;
+    stat = fs.lstatSync(lockPath);
   } catch (error: any) {
     if (error?.code === 'ENOENT') return { kind: 'retry' };
     return { kind: 'held' };
+  }
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(ownerPath(lockPath, stat.isDirectory()), 'utf8');
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') return { kind: 'held' };
+
+    // mkdir() and owner.json creation are separate syscalls. Give a fresh,
+    // ownerless directory a grace period, but do not let a crashed writer
+    // leave an empty lock directory that blocks every future backup forever.
+    if (!stat.isDirectory()) return { kind: 'retry' };
+    const ageMs = runtime.now() - stat.mtimeMs;
+    if (ageMs <= LOCK_STALE_MS) return { kind: 'held' };
+    console.warn(`⚠️ Reclaiming stale backup lock without owner (age: ${Math.round(ageMs / 1000)}s)`);
+    return { kind: 'reclaim', tombstone: tombstonePath(lockPath, null, stat.ino) };
   }
 
   const record = parseLock(raw);
@@ -99,16 +110,16 @@ function inspectLock(lockPath: string, runtime: LockRuntime): LockDecision {
     try {
       if (runtime.isProcessAlive(record.pid)) return { kind: 'held' };
       console.warn(`⚠️ Reclaiming backup lock from dead PID ${record.pid}`);
-      return { kind: 'reclaim', tombstone: tombstonePath(lockPath, record, inode) };
+      return { kind: 'reclaim', tombstone: tombstonePath(lockPath, record, stat.ino) };
     } catch {
       return { kind: 'held' };
     }
   }
 
-  const ageMs = runtime.now() - mtimeMs;
+  const ageMs = runtime.now() - stat.mtimeMs;
   if (ageMs <= LOCK_STALE_MS) return { kind: 'held' };
   console.warn(`⚠️ Reclaiming malformed stale backup lock (age: ${Math.round(ageMs / 1000)}s)`);
-  return { kind: 'reclaim', tombstone: tombstonePath(lockPath, null, inode) };
+  return { kind: 'reclaim', tombstone: tombstonePath(lockPath, null, stat.ino) };
 }
 
 /**

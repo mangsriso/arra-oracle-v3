@@ -16,7 +16,10 @@ import { type BunSQLiteDatabase } from 'drizzle-orm/bun-sqlite';
 import { Database } from 'bun:sqlite';
 import * as schema from './db/schema.ts';
 import { createDatabase } from './db/index.ts';
-import { createVectorStore } from './vector/factory.ts';
+import {
+  createVectorStore,
+  resolveVectorStoreConfigForModel,
+} from './vector/factory.ts';
 import type { VectorStoreAdapter } from './vector/types.ts';
 import path from 'path';
 import fs from 'fs';
@@ -57,12 +60,7 @@ class OracleMCPServer {
       console.error(`[ToolGroups] Disabled: ${disabledGroups.join(', ')}`);
     }
 
-    this.vectorStore = createVectorStore({
-      type: 'lancedb',
-      collectionName: 'oracle_knowledge_bge_m3',
-      embeddingProvider: 'ollama',
-      embeddingModel: 'bge-m3',
-    });
+    this.vectorStore = createVectorStore(resolveVectorStoreConfigForModel('bge-m3'));
 
     const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname || __dirname, '..', 'package.json'), 'utf-8'));
     this.version = pkg.version;

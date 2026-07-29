@@ -27,11 +27,25 @@ function backupFamily(name: string): string | null {
   const exportMatch = name.match(/^(.+)\.export-.+\.(json|csv)$/);
   if (exportMatch) return `${exportMatch[1]}.export.${exportMatch[2]}`;
 
-  for (const marker of ['backup', 'bak', 'before', 'checkpoint']) {
+  for (const marker of ['backup', 'bak', 'before', 'checkpoint', 'pre-fix']) {
     const match = name.match(new RegExp(`^(.+)\\.${marker}-.+$`));
     if (match) return `${match[1]}.${marker}`;
   }
   return null;
+}
+
+function secureArtifactModes(pathname: string): void {
+  const stat = fs.lstatSync(pathname);
+  if (stat.isSymbolicLink()) return;
+  if (!stat.isDirectory()) {
+    fs.chmodSync(pathname, 0o600);
+    return;
+  }
+
+  fs.chmodSync(pathname, 0o700);
+  for (const name of fs.readdirSync(pathname)) {
+    secureArtifactModes(path.join(pathname, name));
+  }
 }
 
 interface ArtifactSignature {
@@ -104,6 +118,27 @@ function discoverArtifacts(dataDir: string): Artifact[] {
       mtimeMs: stat.mtimeMs,
     });
   }
+
+  // Early releases stored full pre-index snapshots below backups/. Treat each
+  // snapshot directory as one retained artifact instead of ignoring the whole
+  // legacy tree forever.
+  const legacyBackupsDir = path.join(dataDir, 'backups');
+  const legacyBackupsStat = fs.existsSync(legacyBackupsDir)
+    ? fs.lstatSync(legacyBackupsDir)
+    : null;
+  if (legacyBackupsStat?.isDirectory() && !legacyBackupsStat.isSymbolicLink()) {
+    for (const entry of fs.readdirSync(legacyBackupsDir, { withFileTypes: true })) {
+      if (!entry.name.startsWith('pre-index-')) continue;
+      const artifactPath = path.join(legacyBackupsDir, entry.name);
+      const stat = fs.lstatSync(artifactPath);
+      artifacts.push({
+        name: entry.name,
+        path: artifactPath,
+        family: 'backups/pre-index',
+        mtimeMs: stat.mtimeMs,
+      });
+    }
+  }
   return artifacts;
 }
 
@@ -118,6 +153,7 @@ export function trashBackupArtifact(
   source: string,
   trashDir = path.join(os.homedir(), '.trash'),
 ): string {
+  secureArtifactModes(source);
   const destination = path.join(createTrashBatch(trashDir), path.basename(source));
   moveArtifact(source, destination, fs.renameSync);
   return destination;
@@ -136,7 +172,11 @@ export function rotateBackupFamilies(
   }
 
   const byFamily = new Map<string, Artifact[]>();
-  for (const artifact of discoverArtifacts(dataDir)) {
+  const artifacts = discoverArtifacts(dataDir);
+  for (const artifact of artifacts) {
+    // Historical artifacts may predate the 0600/0700 creation contract.
+    // Normalize every matched artifact, including retained ones.
+    secureArtifactModes(artifact.path);
     const family = byFamily.get(artifact.family) || [];
     family.push(artifact);
     byFamily.set(artifact.family, family);

@@ -10,6 +10,11 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import * as C from './const.ts';
 import { resolveOracleHost } from './server/bind.ts';
+import { assertSafeTestRuntime } from './testing/test-safety.ts';
+
+// This must run before path resolution creates ORACLE_DATA_DIR or db/index.ts
+// opens SQLite. Test subprocesses inherit strict mode from tests/preload.ts.
+assertSafeTestRuntime();
 
 // ES Module compatibility for __dirname
 const __filename = fileURLToPath(import.meta.url);

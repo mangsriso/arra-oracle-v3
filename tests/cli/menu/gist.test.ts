@@ -12,7 +12,7 @@ describe("arra-cli menu gist-*", () => {
   }, 30_000);
   afterAll(async () => {
     await clearGist();
-    stopServer();
+    await stopServer();
   });
   beforeEach(async () => {
     await clearGist();

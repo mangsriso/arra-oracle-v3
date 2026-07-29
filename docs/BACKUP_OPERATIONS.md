@@ -60,9 +60,14 @@ every detected top-level family:
 - `*.bak-*`
 - `*.before-*`
 - `*.checkpoint-*`
+- `*.pre-fix-*`
 - `lancedb.backup-*`
 - `pre-fix-*`
+- `backups/pre-index-*` (legacy nested snapshots)
 
 Expired files and directories move into a unique batch directory under
 `~/.trash`; existing history is never overwritten. Cross-filesystem moves use
 a verified copy followed by source removal only after the copy is complete.
+Every matched artifact is normalized before retention: directories are `0700`
+and regular files are `0600`, including artifacts that are kept rather than
+moved. Symlinks are never followed.

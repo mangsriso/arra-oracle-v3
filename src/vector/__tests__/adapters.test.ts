@@ -148,7 +148,8 @@ describe('createVectorStore factory', () => {
   });
 
   test('respects ORACLE_VECTOR_DB env', () => {
-    const orig = process.env.ORACLE_VECTOR_DB;
+    const originalType = process.env.ORACLE_VECTOR_DB;
+    const originalPath = process.env.ORACLE_VECTOR_DB_PATH;
     process.env.ORACLE_VECTOR_DB = 'sqlite-vec';
     process.env.ORACLE_VECTOR_DB_PATH = '/tmp/oracle-test-env.db';
 
@@ -156,9 +157,10 @@ describe('createVectorStore factory', () => {
     expect(store.name).toBe('sqlite-vec');
 
     // Restore
-    if (orig) process.env.ORACLE_VECTOR_DB = orig;
+    if (originalType) process.env.ORACLE_VECTOR_DB = originalType;
     else delete process.env.ORACLE_VECTOR_DB;
-    delete process.env.ORACLE_VECTOR_DB_PATH;
+    if (originalPath) process.env.ORACLE_VECTOR_DB_PATH = originalPath;
+    else delete process.env.ORACLE_VECTOR_DB_PATH;
   });
 });
 

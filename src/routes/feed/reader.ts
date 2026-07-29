@@ -1,4 +1,5 @@
 import type { FeedEvent } from './model.ts';
+import { open } from 'node:fs/promises';
 
 export interface FeedFilters {
   oracle?: string;
@@ -131,6 +132,112 @@ export async function readLocalFeed(
     return a.sequence - b.sequence;
   });
   return { events: heap.map(({ event }) => event), total };
+}
+
+export interface LocalFeedWindow {
+  events: FeedEvent[];
+  /** Number of matching rows in the scanned window. */
+  total: number;
+  /** True only when the entire file was scanned. */
+  totalExact: boolean;
+  scannedBytes: number;
+  truncated: boolean;
+}
+
+/**
+ * Read a bounded tail window for latency-sensitive HTTP requests.
+ *
+ * feed.log is append-only and chronological in normal operation, so the tail
+ * contains the newest records needed by small limits. Filters may match only
+ * older records; in that case the result is deliberately marked inexact
+ * instead of scanning an unbounded file and hiding the cost.
+ */
+export async function readLocalFeedTail(
+  filePath: string,
+  limit: number,
+  filters: FeedFilters = {},
+  maxBytes = 1024 * 1024,
+): Promise<LocalFeedWindow> {
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error(`Feed tail maxBytes must be a positive integer: ${maxBytes}`);
+  }
+
+  let file;
+  try {
+    file = await open(filePath, 'r');
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') {
+      return {
+        events: [],
+        total: 0,
+        totalExact: true,
+        scannedBytes: 0,
+        truncated: false,
+      };
+    }
+    throw error;
+  }
+
+  try {
+    const stat = await file.stat();
+    const start = Math.max(0, stat.size - maxBytes);
+    const bytesToRead = stat.size - start;
+    if (start === 0) {
+      const full = await readLocalFeed(filePath, limit, filters);
+      return {
+        ...full,
+        totalExact: true,
+        scannedBytes: bytesToRead,
+        truncated: false,
+      };
+    }
+
+    const buffer = Buffer.alloc(bytesToRead);
+    const { bytesRead } = await file.read(buffer, 0, bytesToRead, start);
+    let text = buffer.subarray(0, bytesRead).toString('utf8');
+    const firstNewline = text.indexOf('\n');
+    if (firstNewline < 0) {
+      return {
+        events: [],
+        total: 0,
+        totalExact: false,
+        scannedBytes: bytesRead,
+        truncated: true,
+      };
+    }
+    text = text.slice(firstNewline + 1);
+
+    const heap: RankedEvent[] = [];
+    let sequence = 0;
+    let total = 0;
+    for (const rawLine of text.split('\n')) {
+      const line = rawLine.replace(/\r$/, '');
+      if (!line) continue;
+      const event = parseFeedLine(line);
+      const currentSequence = sequence++;
+      if (!feedEventMatches(event, filters)) continue;
+      total += 1;
+      const parsedTimestamp = new Date(event.timestamp).getTime();
+      retainNewest(heap, {
+        event,
+        sequence: currentSequence,
+        timestamp: Number.isNaN(parsedTimestamp) ? Number.NEGATIVE_INFINITY : parsedTimestamp,
+      }, limit);
+    }
+    heap.sort((a, b) => {
+      if (a.timestamp !== b.timestamp) return b.timestamp - a.timestamp;
+      return a.sequence - b.sequence;
+    });
+    return {
+      events: heap.map(({ event }) => event),
+      total,
+      totalExact: false,
+      scannedBytes: bytesRead,
+      truncated: true,
+    };
+  } finally {
+    await file.close();
+  }
 }
 
 export function activeOracles(events: FeedEvent[], now: number = Date.now()): string[] {

@@ -100,6 +100,24 @@ describe('backup file lock', () => {
     expect(acquireLock(lockPath, runtime)).toBe(false);
   });
 
+  it('gives a fresh ownerless lock directory time to finish being written', () => {
+    fs.mkdirSync(lockPath);
+    fs.utimesSync(lockPath, new Date(runtime.now()), new Date(runtime.now()));
+
+    expect(acquireLock(lockPath, runtime)).toBe(false);
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
+  it('reclaims a stale ownerless lock directory left by a crashed writer', () => {
+    fs.mkdirSync(lockPath);
+    const staleTime = runtime.now() - 6 * 60 * 1000;
+    fs.utimesSync(lockPath, new Date(staleTime), new Date(staleTime));
+
+    expect(acquireLock(lockPath, runtime)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(ownerPath, 'utf8')).token).toBe('owner-token');
+    expect(fs.readdirSync(tmpDir).some(name => name.includes('.reclaimed-malformed-'))).toBe(true);
+  });
+
   it('reclaims a malformed lock only after the stale grace period', () => {
     fs.writeFileSync(lockPath, 'not-a-lock');
     const staleTime = runtime.now() - 6 * 60 * 1000;

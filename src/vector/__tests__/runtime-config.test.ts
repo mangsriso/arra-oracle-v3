@@ -5,6 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { resolveEmbeddingRuntime } from '../runtime-config.ts';
+import { resolveVectorStoreConfigForModel } from '../factory.ts';
 
 const originalDataDir = process.env.ORACLE_DATA_DIR;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vector-runtime-config-'));
@@ -66,5 +67,35 @@ describe('embedding runtime configuration', () => {
     expect(() => resolveEmbeddingRuntime(registry.primary, {
       ORACLE_EMBEDDING_MODEL: '   ',
     })).toThrow('Embedding model must not be empty');
+  });
+});
+
+describe('model store configuration', () => {
+  const models = {
+    'bge-m3': {
+      collection: 'fixture_collection',
+      model: 'registry-model',
+      provider: 'ollama' as const,
+      dataPath: '/tmp/fixture-vectors',
+    },
+  };
+
+  it('applies deployment provider/model overrides to the MCP store', () => {
+    expect(resolveVectorStoreConfigForModel('bge-m3', models, {
+      ORACLE_EMBEDDING_PROVIDER: 'openai',
+      ORACLE_EMBEDDING_MODEL: 'deployment-model',
+    })).toEqual({
+      type: 'lancedb',
+      collectionName: 'fixture_collection',
+      embeddingProvider: 'openai',
+      embeddingModel: 'deployment-model',
+      dataPath: '/tmp/fixture-vectors',
+    });
+  });
+
+  it('fails instead of silently selecting an unknown registry model', () => {
+    expect(() => resolveVectorStoreConfigForModel('missing', models, {})).toThrow(
+      'Unknown embedding model registry key',
+    );
   });
 });

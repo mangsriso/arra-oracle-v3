@@ -3,71 +3,22 @@
  * Tests arra-oracle server endpoints (see const.ts for server name)
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import type { Subprocess } from "bun";
+import {
+  startIsolatedHttpServer,
+  type IsolatedHttpServer,
+} from "../../tests/support/isolated-http-server.ts";
 
-const BASE_URL = "http://localhost:47778";
-let serverProcess: Subprocess | null = null;
-
-async function waitForServer(maxAttempts = 30): Promise<boolean> {
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const res = await fetch(`${BASE_URL}/api/health`);
-      if (res.ok) return true;
-    } catch {
-      // Server not ready yet
-    }
-    await Bun.sleep(500);
-  }
-  return false;
-}
-
-async function isServerRunning(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BASE_URL}/api/health`);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
+let BASE_URL = "";
+let fixture: IsolatedHttpServer | null = null;
 
 describe("HTTP API Integration", () => {
   beforeAll(async () => {
-    // Check if server already running
-    if (await isServerRunning()) {
-      console.log("Using existing server");
-      return;
-    }
-
-    // Start server
-    console.log("Starting server...");
-    serverProcess = Bun.spawn(["bun", "run", "src/server.ts"], {
-      cwd: import.meta.dir.replace("/src/integration", ""),
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, ORACLE_CHROMA_TIMEOUT: "3000" },
-    });
-
-    const ready = await waitForServer();
-    if (!ready) {
-      // Capture server stderr for debugging
-      let stderr = '';
-      if (serverProcess.stderr) {
-        const reader = serverProcess.stderr.getReader();
-        try {
-          const { value } = await reader.read();
-          if (value) stderr = new TextDecoder().decode(value);
-        } catch { /* ignore */ }
-      }
-      throw new Error(`Server failed to start within 15 seconds.\nServer stderr: ${stderr}`);
-    }
-    console.log("Server ready");
+    fixture = await startIsolatedHttpServer("oracle-integration-http");
+    BASE_URL = fixture.baseUrl;
   }, 30_000);
 
-  afterAll(() => {
-    if (serverProcess) {
-      serverProcess.kill();
-      console.log("Server stopped");
-    }
+  afterAll(async () => {
+    if (fixture) await fixture.stop();
   });
 
   // ===================

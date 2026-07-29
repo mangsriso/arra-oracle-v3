@@ -1,8 +1,9 @@
 import { Elysia } from 'elysia';
 import { PORT, REPO_ROOT } from '../../config.ts';
 import { MCP_SERVER_NAME } from '../../const.ts';
-import { getVaultPsiRoot } from '../../vault/handler.ts';
+import { resolveVaultPath } from '../../vault/discovery.ts';
 import { getSetting } from '../../db/index.ts';
+import { resolveVaultHealth } from './vault-health.ts';
 import pkg from '../../../package.json' with { type: 'json' };
 
 /**
@@ -18,28 +19,11 @@ import pkg from '../../../package.json' with { type: 'json' };
  * `degraded` is the load-bearing case: a vault IS configured but did not
  * resolve, so writes are landing outside their project scope.
  */
-function vaultHealth(): {
-  state: 'ok' | 'degraded' | 'not-configured';
-  repo: string | null;
-  path?: string;
-  hint?: string;
-} {
-  let repo: string | null = null;
-  try {
-    repo = getSetting('vault_repo');
-  } catch {
-    // DB unreadable — report unknown rather than failing liveness.
-    return { state: 'degraded', repo: null, hint: 'settings table unreadable' };
-  }
-  if (!repo) return { state: 'not-configured', repo: null };
-
-  const vault = getVaultPsiRoot();
-  if ('path' in vault) return { state: 'ok', repo, path: vault.path };
-  return { state: 'degraded', repo, hint: vault.hint };
-}
-
 export const healthEndpoint = new Elysia().get('/health', () => {
-  const vault = vaultHealth();
+  const vault = resolveVaultHealth({
+    getRepo: () => getSetting('vault_repo'),
+    resolveRepo: resolveVaultPath,
+  });
   return {
     status: 'ok',
     server: MCP_SERVER_NAME,

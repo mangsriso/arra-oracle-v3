@@ -19,7 +19,7 @@ export interface SyncDeps {
 const defaultDeps: SyncDeps = {
   migrate: runMigrate,
   spawnIndexer: () => {
-    Bun.spawn(['bun', 'run', 'src/indexer/cli.ts'], {
+    Bun.spawn([process.execPath, 'run', 'src/indexer/cli.ts'], {
       cwd: process.cwd(),
       stdout: 'inherit',
       stderr: 'inherit',
