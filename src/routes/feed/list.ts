@@ -1,37 +1,29 @@
 import { Elysia } from 'elysia';
-import fs from 'fs';
 import { FEED_LOG } from '../../config.ts';
 import { FeedQuery, type FeedEvent } from './model.ts';
+import {
+  activeOracles,
+  compareFeedEvents,
+  feedEventMatches,
+  readLocalFeed,
+} from './reader.ts';
 
 const MAW_JS_URL = process.env.MAW_JS_URL || 'http://localhost:3456';
 
 export const listFeedRoute = new Elysia().get('/', async ({ query, set }) => {
   try {
-    const limit = Math.min(200, parseInt(query.limit || '50'));
+    const parsedLimit = parseInt(query.limit || '50');
+    const limit = Number.isNaN(parsedLimit) ? 0 : Math.max(0, Math.min(200, parsedLimit));
     const oracle = query.oracle || undefined;
     const event = query.event || undefined;
     const since = query.since || undefined;
+    const filters = { oracle, event, since };
 
-    let allEvents: FeedEvent[] = [];
-
-    if (fs.existsSync(FEED_LOG)) {
-      const raw = fs.readFileSync(FEED_LOG, 'utf-8').trim().split('\n').filter(Boolean);
-      const localEvents: FeedEvent[] = raw.map(line => {
-        const [ts, oracleName, host, eventType, project, rest] = line.split(' | ').map(s => s.trim());
-        const [sessionId, ...msgParts] = (rest || '').split(' » ');
-        return {
-          timestamp: ts,
-          oracle: oracleName,
-          host,
-          event: eventType,
-          project,
-          session_id: sessionId?.trim(),
-          message: msgParts.join(' » ').trim(),
-          source: 'local',
-        };
-      });
-      allEvents.push(...localEvents);
-    }
+    const local = await Bun.file(FEED_LOG).exists()
+      ? await readLocalFeed(FEED_LOG, limit, filters)
+      : { events: [], total: 0 };
+    let allEvents: FeedEvent[] = [...local.events];
+    let total = local.total;
 
     try {
       const mawRes = await fetch(`${MAW_JS_URL}/api/feed?limit=100`, { signal: AbortSignal.timeout(2000) });
@@ -48,25 +40,18 @@ export const listFeedRoute = new Elysia().get('/', async ({ query, set }) => {
             message: e.message,
             source: 'maw-js',
           }));
-          allEvents.push(...mawEvents);
+          const matchingMawEvents = mawEvents.filter((mawEvent) => feedEventMatches(mawEvent, filters));
+          total += matchingMawEvents.length;
+          allEvents.push(...matchingMawEvents);
         }
       }
     } catch (mawError) {
       console.log('maw-js feed unavailable:', mawError);
     }
 
-    if (oracle) allEvents = allEvents.filter(e => e.oracle === oracle);
-    if (event) allEvents = allEvents.filter(e => e.event === event);
-    if (since) allEvents = allEvents.filter(e => e.timestamp >= since);
-
-    allEvents.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-    const total = allEvents.length;
+    allEvents.sort(compareFeedEvents);
     allEvents = allEvents.slice(0, limit);
-
-    const fiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString().replace('T', ' ').slice(0, 19);
-    const activeOracles = [...new Set(allEvents.filter(e => e.timestamp >= fiveMinAgo).map(e => e.oracle))];
-
-    return { events: allEvents, total, active_oracles: activeOracles };
+    return { events: allEvents, total, active_oracles: activeOracles(allEvents) };
   } catch (e: any) {
     set.status = 500;
     return { error: e.message, events: [], total: 0 };

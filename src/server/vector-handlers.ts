@@ -25,6 +25,7 @@ import {
   EMBEDDING_MODELS,
 } from '../vector/factory.ts';
 import type { VectorStoreAdapter } from '../vector/types.ts';
+import { isStringArray, parseRecordJson } from '../vector/safe-json.ts';
 import type { SearchResult } from './types.ts';
 
 /** Convenience wrapper used by every handler in this file. */
@@ -350,7 +351,13 @@ export async function handleMap3d(model?: string): Promise<{
         docLookup.set(row.id, {
           type: row.type,
           sourceFile: row.sourceFile,
-          concepts: row.concepts ? JSON.parse(row.concepts) : [],
+          concepts: parseRecordJson(
+            row.concepts,
+            [],
+            'sqlite.concepts',
+            row.id,
+            isStringArray,
+          ),
           project: row.project || null,
           createdAt: row.createdAt,
         });
