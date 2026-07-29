@@ -6,6 +6,7 @@
  */
 
 import type { VectorStoreAdapter, VectorDocument, VectorQueryResult, EmbeddingProvider } from '../types.ts';
+import { isJsonObject, parseRecordJson } from '../safe-json.ts';
 
 export class LanceDBAdapter implements VectorStoreAdapter {
   readonly name = 'lancedb';
@@ -59,12 +60,18 @@ export class LanceDBAdapter implements VectorStoreAdapter {
   async deleteCollection(): Promise<void> {
     if (!this.db) throw new Error('LanceDB not connected');
 
+    const tableNames = await this.db.tableNames();
+    if (!tableNames.includes(this.collectionName)) {
+      this.table = null;
+      return;
+    }
     try {
       await this.db.dropTable(this.collectionName);
       this.table = null;
       console.log(`[LanceDB] Collection '${this.collectionName}' deleted`);
     } catch (e) {
       console.warn('[LanceDB] deleteCollection failed:', e instanceof Error ? e.message : String(e));
+      throw e;
     }
   }
 
@@ -188,7 +195,13 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     return {
       ids: rows.map((r: any) => r.id),
       embeddings: rows.map((r: any) => Array.from(r.vector)),
-      metadatas: rows.map((r: any) => JSON.parse(r.metadata || '{}')),
+      metadatas: rows.map((r: any) => parseRecordJson(
+        r.metadata,
+        {},
+        'lancedb.metadata',
+        String(r.id),
+        isJsonObject,
+      )),
     };
   }
 }

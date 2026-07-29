@@ -1,0 +1,48 @@
+# Vector Operations
+
+## Canonical production launch contract
+
+Every process that reads or writes vector collections—the main Oracle server,
+vector sidecar, and indexer daemon—must receive the same embedding environment.
+The provider/model identity used to create a collection must also be used for
+queries and later indexing.
+
+Runtime configuration resolves in this order:
+
+1. `ORACLE_EMBEDDING_PROVIDER` and `ORACLE_EMBEDDING_MODEL`, when exported by
+   the process launcher.
+2. The collection's `provider` and `model` in
+   `$ORACLE_DATA_DIR/vector-server.json`.
+3. Built-in registry defaults when the config file is absent.
+
+The collection name and `dataPath` come from the same registry entry. Provider
+credentials and provider-specific endpoints remain environment variables; do
+not put credential values in `vector-server.json` or documentation. For an
+OpenAI-compatible provider, the relevant names are `ORACLE_OPENAI_API_KEY` and
+`ORACLE_OPENAI_BASE_URL`.
+
+An operator should launch the main server, vector sidecar, and indexer daemon
+through service definitions that export the same environment source. Direct
+shell launches must reproduce that environment explicitly.
+
+## Destructive reindex
+
+Both reindex APIs delete the selected collection before rebuilding it:
+
+- `POST /api/vector/index/start`
+- `POST /api/indexer/start`
+
+They reject the request unless its JSON body includes the exact acknowledgement:
+
+```json
+{
+  "confirmation": "REINDEX_DELETE_COLLECTION",
+  "model": "bge-m3"
+}
+```
+
+Confirmation is an operational interlock, not authentication. Access control
+must still protect these endpoints. Before a confirmed rebuild, verify the
+database backup, collection target, provider/model identity, and registry data
+path. A missing or incorrect confirmation must not open a database, create an
+embedding provider, start a background job, or touch a collection.

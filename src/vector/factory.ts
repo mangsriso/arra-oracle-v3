@@ -16,6 +16,8 @@ import { QdrantAdapter } from './adapters/qdrant.ts';
 import { CloudflareVectorizeAdapter, CloudflareAIEmbeddings } from './adapters/cloudflare-vectorize.ts';
 import { createEmbeddingProvider } from './embeddings.ts';
 import { loadVectorConfig, configToModels } from './config.ts';
+import type { EmbeddingModelPreset } from './config.ts';
+import { resolveEmbeddingRuntime } from './runtime-config.ts';
 
 export interface VectorStoreConfig {
   type?: VectorDBType;
@@ -132,7 +134,7 @@ export function createVectorStore(config: VectorStoreConfig = {}): VectorStoreAd
 // Model-based registry for dual-index search
 // ============================================================================
 
-export function getEmbeddingModels(): Record<string, { collection: string; model: string; dataPath?: string }> {
+export function getEmbeddingModels(): Record<string, EmbeddingModelPreset> {
   // If vector-server.json exists, use it as source of truth (#1071 phase 2)
   const cfg = loadVectorConfig();
   if (cfg) return configToModels(cfg);
@@ -142,23 +144,26 @@ export function getEmbeddingModels(): Record<string, { collection: string; model
     nomic: {
       collection: COLLECTION_NAME,
       model: 'nomic-embed-text',
+      provider: 'ollama',
       dataPath: LANCEDB_DIR,
     },
     qwen3: {
       collection: 'oracle_knowledge_qwen3',
       model: 'qwen3-embedding',
+      provider: 'ollama',
       dataPath: LANCEDB_DIR,
     },
     'bge-m3': {
       collection: 'oracle_knowledge_bge_m3',
       model: 'bge-m3',
+      provider: 'ollama',
       dataPath: LANCEDB_DIR,
     },
   };
 }
 
 /** @deprecated Use getEmbeddingModels() — kept for backward compat */
-export const EMBEDDING_MODELS = new Proxy({} as Record<string, { collection: string; model: string; dataPath?: string }>, {
+export const EMBEDDING_MODELS = new Proxy({} as Record<string, EmbeddingModelPreset>, {
   get(_, prop: string) { return getEmbeddingModels()[prop]; },
   has(_, prop: string) { return prop in getEmbeddingModels(); },
   ownKeys() { return Object.keys(getEmbeddingModels()); },
@@ -173,7 +178,7 @@ const modelStoreCache = new Map<string, VectorStoreAdapter>();
 
 /**
  * Get a vector store for a specific embedding model.
- * Uses LanceDB + env-configured embedding provider (default: ollama).
+ * Uses LanceDB + deployment env overrides, falling back to the model registry.
  * Caches instances by model key.
  */
 const connectPromises = new Map<string, Promise<void>>();
@@ -184,13 +189,12 @@ export function getVectorStoreByModel(model?: string): VectorStoreAdapter {
   let store = modelStoreCache.get(key);
   if (!store) {
     const preset = models[key];
-    const provider = (process.env.ORACLE_EMBEDDING_PROVIDER as EmbeddingProviderType) || 'ollama';
-    const embeddingModel = process.env.ORACLE_EMBEDDING_MODEL || preset.model;
+    const embedding = resolveEmbeddingRuntime(preset);
     store = createVectorStore({
       type: 'lancedb',
       collectionName: preset.collection,
-      embeddingProvider: provider,
-      embeddingModel,
+      embeddingProvider: embedding.provider,
+      embeddingModel: embedding.model,
       ...(preset.dataPath && { dataPath: preset.dataPath }),
     });
     modelStoreCache.set(key, store);
