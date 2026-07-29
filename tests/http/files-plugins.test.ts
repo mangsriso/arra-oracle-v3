@@ -9,10 +9,8 @@ import { join } from 'path';
 const WASM_HEADER = Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 
 let tmp: string;
-// combined: mirrors production — files.ts registers /api/plugins first and
-// shadows plugins.ts. pluginsOnly: canonical dual-layout scanner in isolation.
+// Mirrors production order: files first, then the canonical plugins router.
 let combined: any;
-let pluginsOnly: any;
 
 beforeAll(async () => {
   tmp = mkdtempSync(join(realOs.tmpdir(), 'blue-http-'));
@@ -60,14 +58,7 @@ beforeAll(async () => {
   const { filesRouter } = await import('../../src/routes/files/index.ts');
   const { pluginsRouter } = await import('../../src/routes/plugins/index.ts');
 
-  // combined: filesRouter only — it already bundles the legacy flat
-  // /api/plugins + /api/plugins/:name (files/plugins.ts + files/plugin-by-name.ts),
-  // shadowing the canonical dual-layout scanner. Mixing in pluginsRouter
-  // here would not change observable behavior because Elysia's parametric
-  // route resolution is first-match on the internal tree — filesRouter
-  // alone is the source of truth for the "combined" contract.
-  combined = new Elysia().use(filesRouter);
-  pluginsOnly = new Elysia().use(pluginsRouter);
+  combined = new Elysia().use(filesRouter).use(pluginsRouter);
 });
 
 const req = (path: string) => new Request(`http://localhost${path}`);
@@ -166,48 +157,40 @@ describe('GET /api/context', () => {
   });
 });
 
-describe('GET /api/plugins (combined app — files.ts handler wins)', () => {
-  test('lists flat .wasm entries from PLUGINS_DIR', async () => {
+describe('GET /api/plugins (production router shape)', () => {
+  test('uses the canonical dual-layout response', async () => {
     const res = await combined.handle(req('/api/plugins'));
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { plugins: Array<{ name: string; file: string }> };
-    expect(Array.isArray(body.plugins)).toBe(true);
-    const names = body.plugins.map((p) => p.name);
-    expect(names).toContain('alpha');
+    const body = (await res.json()) as {
+      dir: string;
+      plugins: Array<{ name: string; file: string; version?: string }>;
+    };
+    const names = body.plugins.map((p) => p.name).sort();
+    expect(body.dir).toContain('.oracle');
+    expect(names).toEqual(['flat', 'nested-plugin']);
+    expect(names).not.toContain('alpha');
+    expect(body.plugins.find((p) => p.name === 'nested-plugin')?.version).toBe('2.0.0');
   });
 });
 
-describe('GET /api/plugins/:name (combined app)', () => {
-  test('serves wasm bytes with application/wasm content-type', async () => {
-    const res = await combined.handle(req('/api/plugins/alpha'));
+describe('GET /api/plugins/:name (production router shape)', () => {
+  test('serves canonical flat wasm bytes with application/wasm content-type', async () => {
+    const res = await combined.handle(req('/api/plugins/flat'));
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('wasm');
     const buf = new Uint8Array(await res.arrayBuffer());
     expect(buf.slice(0, 4)).toEqual(new Uint8Array([0x00, 0x61, 0x73, 0x6d]));
   });
 
-  test('returns 404 for missing plugin', async () => {
-    const res = await combined.handle(req('/api/plugins/no-such-plugin'));
+  test('does not resolve a legacy ORACLE_DATA_DIR plugin', async () => {
+    const res = await combined.handle(req('/api/plugins/alpha'));
     expect(res.status).toBe(404);
   });
 });
 
-describe('plugins.ts scanner (dual-layout, isolated)', () => {
-  test('lists both flat and nested plugins', async () => {
-    const res = await pluginsOnly.handle(req('/api/plugins'));
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      dir: string;
-      plugins: Array<{ name: string; file: string; version?: string }>;
-    };
-    expect(body.dir).toContain('.oracle');
-    const names = body.plugins.map((p) => p.name).sort();
-    expect(names).toContain('flat');
-    expect(names).toContain('nested-plugin');
-  });
-
+describe('canonical dual-layout plugin scanner', () => {
   test('nested plugin resolves via basename fallback', async () => {
-    const res = await pluginsOnly.handle(req('/api/plugins'));
+    const res = await combined.handle(req('/api/plugins'));
     const body = (await res.json()) as {
       plugins: Array<{ name: string; file: string; version?: string }>;
     };
@@ -219,14 +202,14 @@ describe('plugins.ts scanner (dual-layout, isolated)', () => {
   });
 
   test('serves nested wasm bytes via basename fallback', async () => {
-    const res = await pluginsOnly.handle(req('/api/plugins/nested-plugin'));
+    const res = await combined.handle(req('/api/plugins/nested-plugin'));
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('wasm');
   });
 
   test('strips special characters from :name before lookup', async () => {
     // `../flat` should be sanitized to `flat` (regex keeps \w.- only).
-    const res = await pluginsOnly.handle(req('/api/plugins/..%2Fflat'));
+    const res = await combined.handle(req('/api/plugins/..%2Fflat'));
     // Either 200 (sanitized to "flat") or 404 — never serves a traversal.
     expect([200, 404]).toContain(res.status);
     if (res.status === 200) {
@@ -235,7 +218,7 @@ describe('plugins.ts scanner (dual-layout, isolated)', () => {
   });
 
   test('returns 404 for truly missing plugin', async () => {
-    const res = await pluginsOnly.handle(req('/api/plugins/ghost'));
+    const res = await combined.handle(req('/api/plugins/ghost'));
     expect(res.status).toBe(404);
   });
 });

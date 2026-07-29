@@ -3,6 +3,35 @@ import { apiFetch } from "../../lib/api.ts";
 
 const PORT = process.env.ORACLE_PORT || process.env.PORT || "47778";
 
+function stopFailure(json: boolean, reason: string): InvokeResult {
+  const result = { stopped: false, reason };
+  return {
+    ok: false,
+    error: json
+      ? JSON.stringify(result)
+      : `Failed to stop Oracle server: ${reason}.`,
+  };
+}
+
+export async function stopOracleServer(
+  json: boolean,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<InvokeResult> {
+  try {
+    const res = await fetchImpl(`http://localhost:${PORT}/api/shutdown`, {
+      method: "POST",
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) {
+      return stopFailure(json, `shutdown endpoint returned HTTP ${res.status}`);
+    }
+    if (json) return { ok: true, output: JSON.stringify({ stopped: true }) };
+    return { ok: true, output: "Oracle server stopped." };
+  } catch {
+    return stopFailure(json, "not running or /api/shutdown unavailable");
+  }
+}
+
 export default async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   const sub = ctx.args[0] || "status";
   const json = ctx.args.includes("--json");
@@ -21,14 +50,7 @@ export default async function handler(ctx: InvokeContext): Promise<InvokeResult>
   }
 
   if (sub === "stop") {
-    try {
-      const res = await fetch(`http://localhost:${PORT}/api/shutdown`, { method: "POST", signal: AbortSignal.timeout(5000) });
-      if (json) return { ok: true, output: JSON.stringify({ stopped: true }) };
-      return { ok: true, output: "Oracle server stopped." };
-    } catch {
-      if (json) return { ok: true, output: JSON.stringify({ stopped: false, reason: "not running or no /api/shutdown" }) };
-      return { ok: true, output: "Server not running or /api/shutdown unavailable." };
-    }
+    return stopOracleServer(json);
   }
 
   if (sub === "start") {
