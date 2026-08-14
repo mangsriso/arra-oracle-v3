@@ -31,7 +31,8 @@ export const learnToolDef = {
     properties: {
       pattern: {
         type: 'string',
-        description: 'The pattern or learning to add (can be multi-line)'
+        minLength: 1,
+        description: 'The pattern or learning to add (can be multi-line). Must be non-empty and not whitespace-only.'
       },
       source: {
         type: 'string',
@@ -106,6 +107,34 @@ export function extractProjectFromSource(source?: string): string | null {
 // ============================================================================
 
 export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Promise<ToolResponse> {
+  // The MCP dispatch path casts arguments without validating them against
+  // inputSchema, so a caller sending the wrong keys reaches here with pattern
+  // undefined and dies on `pattern.substring` — an opaque TypeError that reads
+  // like a broken tool. Fail with the contract instead.
+  //
+  // Scope, precisely: the HTTP /api/learn route guards only a FALSY pattern
+  // (routes/knowledge/learn.ts) and its body schema is `t.Any()`, so it still
+  // lets a truthy non-string through to the same class of TypeError in
+  // server/handlers.ts. This guard covers the MCP path only; the wrong-type
+  // hole on the HTTP path and the identical blind `args as T` cast for every
+  // other tool in dispatch.ts are pre-existing and NOT fixed here — the real
+  // fix is central inputSchema validation before dispatch.
+  //
+  // Rejecting empty / whitespace-only pattern is a deliberate tightening
+  // (previously it wrote a junk learning named `pattern-<timestamp>` with no
+  // content); inputSchema now declares `minLength: 1` so discovery and runtime
+  // agree. Covered by __tests__/learn-guard.test.ts.
+  if (typeof input?.pattern !== 'string' || input.pattern.trim() === '') {
+    return {
+      content: [{
+        type: 'text',
+        text: `Error: arra_learn requires a non-empty string "pattern". Received keys: [${Object.keys(input ?? {}).join(', ')}]. `
+          + 'The learning text goes in "pattern"; tags go in "concepts". There is no "title"/"content"/"tags" parameter.',
+      }],
+      isError: true,
+    };
+  }
+
   const { pattern, source, concepts, project: projectInput } = input;
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
