@@ -12,11 +12,35 @@
  * short-circuits before calling logSearch, so this file never touches the
  * live search_log even though it imports the real handleSearch.
  */
-import { describe, it, expect, beforeAll } from 'bun:test';
+import { describe, it, expect, beforeAll, mock } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { initFts5 } from '../../db/index.ts';
-import { handleSearch } from '../search.ts';
 import type { ToolContext } from '../types.ts';
+
+// tests/preload.ts (bunfig global preload) forces ORACLE_DISABLE_LOCAL_VECTOR=true
+// for every bun test run, and src/testing/test-safety.ts:77 hard-throws if that
+// invariant does not hold — a deliberate rail (the real LanceDB path SIGILLs on
+// AVX-only CPUs). Route around it for THIS FILE ONLY, before search.ts is
+// imported, so the vector leg is reachable and T5 can observe the property the
+// plan actually specified: hybrid returns VECTOR results when FTS throws.
+// Never weaken the global rail; mock.module is process-wide in bun, so this file
+// owns the DISABLE_LOCAL_VECTOR-dependent assertions rather than splitting them
+// across files where the leak would make them order-dependent.
+const CONFIG = '../../config.ts';
+const actualConfig = await import(CONFIG);
+mock.module(CONFIG, () => ({ ...actualConfig, DISABLE_LOCAL_VECTOR: false }));
+
+const { initFts5 } = await import('../../db/index.ts');
+const { handleSearch } = await import('../search.ts');
+
+// Minimal vector backend: one doc, close distance. Never touches LanceDB.
+const stubVectorStore = {
+  query: async () => ({
+    ids: ['VEC_DOC1'],
+    metadatas: [{ type: 'learning', source_file: 'fixture/vec-doc1.md', concepts: '[]' }],
+    documents: ['EfficientIP check=1 destructive DHCP overwrite gotcha'],
+    distances: [0.11],
+  }),
+};
 
 // DEVIATION FROM PLAN (recorded in the impl report): tests/preload.ts
 // (bunfig.toml global preload) forces ORACLE_DISABLE_LOCAL_VECTOR=true for
@@ -108,18 +132,25 @@ describe('search FTS-fault fallback (DEFECT 2 gate, plan Part 1.3)', () => {
     realDb = makeFixtureDb();
   });
 
-  it('T5: mode=hybrid + injected FTS fault resolves (no throw) with composed FTS+vector warnings and ftsError metadata', async () => {
-    const ctx = makeCtx(makeFaultInjectingSqlite(realDb));
+  it('T5: mode=hybrid + injected FTS fault returns VECTOR results, not empty (the DEFECT 2 property)', async () => {
+    const ctx = { ...makeCtx(makeFaultInjectingSqlite(realDb)), vectorStore: stubVectorStore } as ToolContext;
     const resp = await handleSearch(ctx, { query: 'EfficientIP check overwrite', mode: 'hybrid', limit: 10 });
     const parsed = JSON.parse(resp.content[0]!.text);
-    // Vector leg is also unavailable in this harness (see DEVIATION note),
-    // so results are empty here — the property under test is that hybrid
-    // mode resolves at all (no throw) and both warnings compose (§2.2d).
-    expect(parsed.results).toEqual([]);
+    // The whole point of the fallback: FTS died, the search still answers.
+    expect(parsed.results.length).toBeGreaterThan(0);
+    expect(parsed.results.some((r: { id: string }) => r.id === 'VEC_DOC1')).toBe(true);
     expect(parsed.metadata.warning).toMatch(/FTS5 query failed/);
-    expect(parsed.metadata.warning).toMatch(/Local vector adapter disabled/);
+    expect(parsed.metadata.warning).toMatch(/vector-only/);
     expect(parsed.metadata.ftsError).toBe(true);
     expect(parsed.metadata.ftsMatches).toBe(0);
+  });
+
+  it('T5b: control — no FTS fault, hybrid reports no ftsError and still returns the vector doc', async () => {
+    const ctx = { ...makeCtx(realDb), vectorStore: stubVectorStore } as ToolContext;
+    const resp = await handleSearch(ctx, { query: 'EfficientIP check overwrite', mode: 'hybrid', limit: 10 });
+    const parsed = JSON.parse(resp.content[0]!.text);
+    expect(parsed.metadata.ftsError).toBeUndefined();
+    expect(parsed.results.some((r: { id: string }) => r.id === 'VEC_DOC1')).toBe(true);
   });
 
   it('T6: mode=fts + injected FTS fault resolves to empty results with warning, no throw', async () => {
