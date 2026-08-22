@@ -5,7 +5,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank, sanitizeFtsQuery } from '../search-quality.ts';
+import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank, normalizeVectorDistance, sanitizeFtsQuery } from '../search-quality.ts';
 import { sanitizeFtsQuery as sanitizeFtsQueryFromToolsTwin } from '../../tools/search.ts';
 
 function makeDb(rows: Array<{ id: string; project?: string | null; superseded_by?: string | null }>) {
@@ -80,6 +80,46 @@ describe('annotateAndFilterSuperseded', () => {
     const { results, hidden } = annotateAndFilterSuperseded(db, [], false);
     expect(results).toEqual([]);
     expect(hidden).toBe(0);
+  });
+});
+
+describe('normalizeVectorDistance', () => {
+  test('is strictly decreasing in distance (nearer = better) and stays in [0,1]', () => {
+    expect(normalizeVectorDistance(0)).toBe(1);
+    expect(normalizeVectorDistance(0.25)).toBeGreaterThan(normalizeVectorDistance(0.5));
+    expect(normalizeVectorDistance(0.5)).toBeGreaterThan(normalizeVectorDistance(1));
+    expect(normalizeVectorDistance(2)).toBe(0);
+    for (const d of [0, 0.25, 0.43, 0.61, 1, 1.5, 2]) {
+      const s = normalizeVectorDistance(d);
+      expect(s).toBeGreaterThanOrEqual(0);
+      expect(s).toBeLessThanOrEqual(1);
+    }
+  });
+
+  test('clamps distances outside the dot-distance domain instead of leaving [0,1]', () => {
+    // Anti-correlated embeddings (d > 2) and any adapter reporting a negative
+    // distance must not break the documented 0-1 score contract.
+    expect(normalizeVectorDistance(2.4)).toBe(0);
+    expect(normalizeVectorDistance(-0.3)).toBe(1);
+  });
+
+  // Regression guard for the 2026-08-22 defect. The HTTP path used
+  // `1 / (1 + distance / 100)`, which mapped the whole measured range of real
+  // top-N dot-distances (~[0.26, 0.61]) into [0.9940, 0.9974]. Because
+  // handleSearch merges the two legs with max(fts, vector), that band beat
+  // EVERY bm25-normalized FTS score, so an exact single-document token match
+  // sank to rank 157/157 and vanished entirely at the default limit=10.
+  // These assertions compare the two shared normalizers against each other —
+  // the scale relationship IS the defect. Both fail under the old formula.
+  test('the vector band no longer swamps the bm25 band', () => {
+    const bestRealisticVector = normalizeVectorDistance(0.26);
+    const decentExactFtsMatch = normalizeBm25Rank(-20);
+    expect(bestRealisticVector).toBeLessThan(decentExactFtsMatch);
+  });
+
+  test('spreads the measured distance range instead of compressing it near 1.0', () => {
+    const spread = normalizeVectorDistance(0.26) - normalizeVectorDistance(0.61);
+    expect(spread).toBeGreaterThan(0.1); // old formula produced 0.0034
   });
 });
 

@@ -27,6 +27,7 @@ import {
 import type { VectorStoreAdapter } from '../vector/types.ts';
 import { isStringArray, parseRecordJson } from '../vector/safe-json.ts';
 import type { SearchResult } from './types.ts';
+import { normalizeVectorDistance } from './search-quality.ts';
 
 /** Convenience wrapper used by every handler in this file. */
 async function getVectorStore(model?: string): Promise<VectorStoreAdapter> {
@@ -66,7 +67,7 @@ export async function handleSimilar(
 
     const results: SearchResult[] = chromaResults.ids.map((id: string, i: number) => {
       const distance = chromaResults.distances?.[i] || 1;
-      const similarity = Math.max(0, 1 - distance / 2);
+      const similarity = normalizeVectorDistance(distance);
       const doc = docMap.get(id);
 
       return {

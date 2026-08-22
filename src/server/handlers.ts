@@ -14,7 +14,7 @@ import { logSearch, logDocumentAccess, logLearning } from './logging.ts';
 import type { SearchResult, SearchResponse } from './types.ts';
 import { ensureVectorStoreConnected, EMBEDDING_MODELS } from '../vector/factory.ts';
 import { detectProject } from './project-detect.ts';
-import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank, sanitizeFtsQuery } from './search-quality.ts';
+import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank, normalizeVectorDistance, sanitizeFtsQuery } from './search-quality.ts';
 import { coerceConcepts } from '../tools/learn.ts';
 import { createVectorProxy } from './vector-proxy.ts';
 
@@ -222,7 +222,7 @@ export async function handleSearch(
         return chromaResults.ids
           .map((id: string, i: number) => {
             const distance = chromaResults.distances?.[i] || 0;
-            const similarity = 1 / (1 + distance / 100);
+            const similarity = normalizeVectorDistance(distance);
             const docProject = projectMap.get(id);
             return {
               id,

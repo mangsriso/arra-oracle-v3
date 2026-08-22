@@ -26,6 +26,26 @@ export function normalizeBm25Rank(rank: number): number {
 }
 
 /**
+ * Normalize a vector-store `distance` to a 0–1 score, higher = better.
+ * Assumes dot-distance over L2-normalized embeddings (d = 1 - cos, so
+ * d ∈ [0, 2]); the clamp keeps the documented 0–1 score contract even if a
+ * future adapter reports outside that range.
+ *
+ * Replaces `1 / (1 + distance / 100)`, which lived in the HTTP path from
+ * 2026-01 to 2026-08-22. Measured dot-distances of real top-N hits sit in
+ * ~[0.25, 0.61], so dividing by 100 mapped EVERY hit into [0.9940, 0.9974] —
+ * a 0.0034-wide band. Since bm25-normalized FTS scores top out near 0.95, the
+ * vector leg won every `max(fts, vector)` merge regardless of relevance: a
+ * query for a token present in exactly ONE document of 26,088 returned that
+ * document at rank 157/157, and at the default limit=10 it did not appear at
+ * all. Third member of the same family as normalizeBm25Rank and
+ * sanitizeFtsQuery — keep ONE definition, never a per-path copy.
+ */
+export function normalizeVectorDistance(distance: number): number {
+  return Math.max(0, Math.min(1, 1 - distance / 2));
+}
+
+/**
  * Sanitize arbitrary user/agent text into a query string that FTS5 MATCH is
  * guaranteed to parse: every whitespace-delimited token becomes a quoted
  * phrase ("…"), internal double-quotes doubled, control chars stripped
