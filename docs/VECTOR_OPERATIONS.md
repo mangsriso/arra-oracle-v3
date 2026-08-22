@@ -58,3 +58,20 @@ backfill becomes visible on the next API/search request without a restart.
 LanceDB engine. A successful external write should advance the version and the
 next stats request should return the new row count. These fields are omitted
 for vector backends that do not expose a native revision.
+
+## Remote vector proxy (VECTOR_URL)
+
+- The caller NEVER trusts the remote's `score`. handleSearch recomputes every
+  proxied vector result as `normalizeVectorDistance(distance ?? 2)` — one
+  normalizer owns the scale on this node regardless of the remote's code
+  version. A result arriving without `distance` scores 0 and adds a warning
+  to the response.
+- The `vector-server.ts` sidecar does NOT serve `/api/search`; hybrid search
+  through `vectorProxy.search()` against the sidecar 404s -> null -> FTS5-only
+  fallback. A proxy deployment needs a full oracle server (or a new sidecar
+  route) behind VECTOR_URL.
+- Setting VECTOR_URL also makes the gateway synthesize an `/api/search` route
+  to the vector service at the Elysia layer (src/gateway/config.ts) — two
+  proxy layers engage from one env var.
+- `VECTOR_FALLBACK` (src/config.ts) is exported but read nowhere — the
+  fts5-fallback behavior is hardcoded in handlers.ts.
