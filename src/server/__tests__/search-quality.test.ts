@@ -5,7 +5,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { annotateAndFilterSuperseded, dedupChunks } from '../search-quality.ts';
+import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank } from '../search-quality.ts';
 
 function makeDb(rows: Array<{ id: string; project?: string | null; superseded_by?: string | null }>) {
   const db = new Database(':memory:');
@@ -79,6 +79,21 @@ describe('annotateAndFilterSuperseded', () => {
     const { results, hidden } = annotateAndFilterSuperseded(db, [], false);
     expect(results).toEqual([]);
     expect(hidden).toBe(0);
+  });
+});
+
+describe('normalizeBm25Rank', () => {
+  test('is strictly increasing in match quality (more negative bm25 = better) and stays in [0,1)', () => {
+    expect(normalizeBm25Rank(-28)).toBeGreaterThan(normalizeBm25Rank(-17));
+    expect(normalizeBm25Rank(-17)).toBeGreaterThan(normalizeBm25Rank(-5));
+    expect(normalizeBm25Rank(-5)).toBeGreaterThan(normalizeBm25Rank(-1));
+    expect(normalizeBm25Rank(-1)).toBeGreaterThan(normalizeBm25Rank(0));
+    expect(normalizeBm25Rank(0)).toBe(0);
+    for (const r of [0, -1, -5, -17, -28, -100]) {
+      const s = normalizeBm25Rank(r);
+      expect(s).toBeGreaterThanOrEqual(0);
+      expect(s).toBeLessThan(1);
+    }
   });
 });
 

@@ -14,7 +14,7 @@ import { logSearch, logDocumentAccess, logLearning } from './logging.ts';
 import type { SearchResult, SearchResponse } from './types.ts';
 import { ensureVectorStoreConnected, EMBEDDING_MODELS } from '../vector/factory.ts';
 import { detectProject } from './project-detect.ts';
-import { annotateAndFilterSuperseded, dedupChunks } from './search-quality.ts';
+import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank } from './search-quality.ts';
 import { coerceConcepts } from '../tools/learn.ts';
 import { createVectorProxy } from './vector-proxy.ts';
 
@@ -318,9 +318,10 @@ export async function handleSearch(
  * Normalize FTS5 rank score to 0-1 range (higher = better)
  */
 function normalizeRank(rank: number): number {
-  // FTS5 rank is negative (more negative = better match)
-  // Convert to positive 0-1 score
-  return Math.min(1, Math.max(0, 1 / (1 + Math.abs(rank))));
+  // FTS5 rank is negative, MORE negative = BETTER match.
+  // Shared monotone-increasing map (bug fix 2026-08-22 — the previous
+  // 1/(1+|rank|) was decreasing in match quality, same defect as the MCP twin).
+  return normalizeBm25Rank(rank);
 }
 
 /**

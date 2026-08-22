@@ -9,7 +9,7 @@
 import { logSearch } from '../server/logging.ts';
 import { detectProject } from '../server/project-detect.ts';
 import { rerankCandidates } from '../server/reranker.ts';
-import { annotateAndFilterSuperseded, dedupChunks } from '../server/search-quality.ts';
+import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank } from '../server/search-quality.ts';
 import { ensureVectorStoreConnected } from '../vector/factory.ts';
 import { DISABLE_LOCAL_VECTOR } from '../config.ts';
 import type { SearchResult } from '../server/types.ts';
@@ -99,13 +99,14 @@ export function sanitizeFtsQuery(query: string): string {
 }
 
 /**
- * Normalize FTS5 rank score using exponential decay.
- * FTS5 rank is negative, lower = better match.
- * Converts to 0-1 scale where higher = better.
+ * Normalize FTS5 rank to a 0-1 score, higher = better.
+ * FTS5 rank is negative and MORE-negative = BETTER match — delegates to the
+ * shared monotone-increasing normalizer (bug fix 2026-08-22: the previous
+ * exp(-0.3|rank|) was monotonically DECREASING in match quality, emitting
+ * fts-mode pages worst-first for ~8 months).
  */
 export function normalizeFtsScore(rank: number): number {
-  const absRank = Math.abs(rank);
-  return Math.exp(-0.3 * absRank);
+  return normalizeBm25Rank(rank);
 }
 
 /**
@@ -369,7 +370,12 @@ export function combineResults(
     if (result.source === 'hybrid') {
       const fts = result.ftsScore ?? 0;
       const vec = result.vectorScore ?? 0;
-      score = ((ftsWeight * fts) + (vectorWeight * vec)) * 1.1;
+      // Cap at 1.0, mirroring the HTTP twin (handlers.ts combineSearchResults).
+      // The 1.1 both-stream bonus could not overflow while ftsScore was ~1e-3
+      // under the old inverted normalizer; with the corrected normalizer an
+      // exact-phrase hit (fts ~0.99) plus a close vector hit (vec > 0.85)
+      // reaches 1.03, breaking the documented 0-1 score contract.
+      score = Math.min(1, ((ftsWeight * fts) + (vectorWeight * vec)) * 1.1);
     } else if (result.source === 'fts') {
       score = (result.ftsScore ?? 0) * ftsWeight;
     } else {

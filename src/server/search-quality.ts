@@ -4,10 +4,24 @@
  *
  * Contract (plan 2026-06-10 Track D): both paths apply the SAME dedup key and
  * SAME survivor rule. Scoring stays per-path (the two combine functions use
- * different algorithms by design) — cross-path score parity is a non-goal.
+ * different algorithms by design) — except bm25-rank normalization, shared
+ * via normalizeBm25Rank since 2026-08.
  */
 
 import type { Database } from 'bun:sqlite';
+
+/**
+ * Normalize an SQLite FTS5 bm25 `rank` to a 0–1 score, higher = better.
+ * FTS5 rank is NEGATIVE and MORE-negative = BETTER match; this map is
+ * strictly increasing in |rank|. Shared by both search twins
+ * (src/tools/search.ts normalizeFtsScore, src/server/handlers.ts
+ * normalizeRank) — the 2026-01→08 inversion bug lived in two divergent
+ * per-path copies; keep ONE definition.
+ */
+export function normalizeBm25Rank(rank: number): number {
+  const absRank = Math.abs(rank);
+  return absRank / (1 + absRank);
+}
 
 export interface QualityCandidate {
   id: string;

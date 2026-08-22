@@ -74,19 +74,23 @@ describe('normalizeFtsScore', () => {
     }
   });
 
-  it('should give better scores for better ranks (closer to 0)', () => {
-    expect(normalizeFtsScore(-1)).toBeGreaterThan(normalizeFtsScore(-5));
-    expect(normalizeFtsScore(-5)).toBeGreaterThan(normalizeFtsScore(-10));
+  it('should give better scores for better ranks (more negative bm25 = better match)', () => {
+    expect(normalizeFtsScore(-5)).toBeGreaterThan(normalizeFtsScore(-1));
+    expect(normalizeFtsScore(-10)).toBeGreaterThan(normalizeFtsScore(-5));
   });
 
-  it('should provide exponential decay', () => {
-    const score1 = normalizeFtsScore(-1);
-    const score2 = normalizeFtsScore(-2);
-    const score3 = normalizeFtsScore(-3);
-
-    const ratio1 = score1 / score2;
-    const ratio2 = score2 / score3;
-    expect(ratio1).toBeCloseTo(ratio2, 1);
+  it('pins the corrected direction and bounds (regression guard for the 2026-01→08 inversion)', () => {
+    // Live smoking-gun pair: bm25 -27.96 (exact-topic doc) must outscore -16.88 (tangential doc).
+    expect(normalizeFtsScore(-27.96)).toBeGreaterThan(normalizeFtsScore(-16.88));
+    // Strict monotonicity across the whole observed range.
+    let prev = normalizeFtsScore(0);
+    for (let r = -0.5; r >= -50; r -= 0.5) {
+      const s = normalizeFtsScore(r);
+      expect(s).toBeGreaterThan(prev);
+      prev = s;
+    }
+    // Zero-signal rank scores zero, not perfect.
+    expect(normalizeFtsScore(0)).toBe(0);
   });
 });
 
@@ -153,6 +157,18 @@ describe('combineResults', () => {
     const doc1 = combined.find(r => r.id === 'doc1');
     // ((0.5 * 0.8) + (0.5 * 0.9)) * 1.1 = 0.935
     expect(doc1?.score).toBeCloseTo(0.935, 2);
+  });
+
+  it('caps the hybrid score at 1.0 (regression guard — see handlers.ts twin)', () => {
+    // Reachable since the 2026-08-22 normalizer fix: an exact-phrase FTS hit
+    // (bm25 -248 -> 0.9960) plus a close vector hit (distance 0.1275 -> 0.8725)
+    // gives ((0.5*0.9960)+(0.5*0.8725))*1.1 = 1.0277 without the cap.
+    const fts = [{ id: 'd', type: 'learning', content: 'c', source_file: 'f.md', concepts: [], score: 0.9960, source: 'fts' as const }];
+    const vec = [{ id: 'd', type: 'learning', content: 'c', source_file: 'f.md', concepts: [], score: 0.8725, source: 'vector' as const }];
+    const doc = combineResults(fts, vec, 0.5, 0.5).find(r => r.id === 'd');
+    expect(doc?.source).toBe('hybrid');
+    expect(doc?.score).toBe(1);
+    expect(doc?.score).toBeLessThanOrEqual(1);
   });
 
   it('should sort by score descending', () => {
