@@ -66,7 +66,7 @@ export async function handleSimilar(
     const docMap = new Map(rows.map(r => [r.id, r]));
 
     const results: SearchResult[] = chromaResults.ids.map((id: string, i: number) => {
-      const distance = chromaResults.distances?.[i] || 1;
+      const distance = chromaResults.distances?.[i] ?? 2;
       const similarity = normalizeVectorDistance(distance);
       const doc = docMap.get(id);
 

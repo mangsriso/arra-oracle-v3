@@ -117,6 +117,15 @@ describe('normalizeVectorDistance', () => {
     expect(bestRealisticVector).toBeLessThan(decentExactFtsMatch);
   });
 
+  test('a non-finite distance scores 0, never a perfect 1.0', () => {
+    // The call sites default a missing distance to the sentinel 2 (score 0);
+    // this covers what still slips through — NaN from a corrupt adapter row,
+    // and infinities. An unknown distance must not outrank a measured match.
+    expect(normalizeVectorDistance(NaN)).toBe(0);
+    expect(normalizeVectorDistance(Infinity)).toBe(0);
+    expect(normalizeVectorDistance(-Infinity)).toBe(0);
+  });
+
   test('spreads the measured distance range instead of compressing it near 1.0', () => {
     const spread = normalizeVectorDistance(0.26) - normalizeVectorDistance(0.61);
     expect(spread).toBeGreaterThan(0.1); // old formula produced 0.0034

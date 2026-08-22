@@ -42,6 +42,9 @@ export function normalizeBm25Rank(rank: number): number {
  * sanitizeFtsQuery — keep ONE definition, never a per-path copy.
  */
 export function normalizeVectorDistance(distance: number): number {
+  // A non-finite distance means the adapter told us nothing usable. Score it
+  // 0, never 1 — an unknown distance must not outrank a measured match.
+  if (!Number.isFinite(distance)) return 0;
   return Math.max(0, Math.min(1, 1 - distance / 2));
 }
 
