@@ -157,7 +157,19 @@ export async function handleSearch(
       model,
     });
     if (remote) {
-      vectorResults = remote.results || [];
+      // Never trust the remote's score scale — the remote may run any code
+      // version. `distance` is the wire contract; recompute the score locally
+      // so ONE normalizer owns the scale on this node.
+      vectorResults = (remote.results || []).map((r) => ({
+        ...r,
+        score: normalizeVectorDistance(r.distance ?? 2),
+      }));
+      const missing = vectorResults.filter((r) => !Number.isFinite(r.distance)).length;
+      if (missing > 0) {
+        const w = `Vector proxy returned ${missing} result(s) without a distance — scored 0.`;
+        console.warn(`[VectorProxy] ${w}`);
+        warning = warning ? `${warning} ${w}` : w;
+      }
     } else {
       vectorAvailable = false;
       warning = warning ? `${warning} Vector proxy unavailable.` : 'Vector proxy unavailable — FTS5-only results';

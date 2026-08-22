@@ -109,3 +109,65 @@ describe('hybrid page survival — the original incident shape', () => {
     expect(res.results.map((r) => r.id)).toContain('FTS_TARGET');
   });
 });
+
+// ============================================================================
+// F2 — proxy vector leg (appended in the F2 commit; SAME file on purpose).
+// mock.module is process-wide and bun may run several test files in ONE
+// process even with [test].isolate=true (verified 2026-08-23: a sibling file
+// mocking ../vector-proxy.ts leaked into this file's handleSearch when both
+// ran in one invocation). The precedent's rule is literal: ONE file owns the
+// handlers-affecting mocks. The proxy instance is loaded through a
+// query-busted specifier AFTER the proxy mock is registered, so THIS import
+// sees the fake proxy while the plain import above (already evaluated,
+// vectorProxy captured as null) keeps exercising the local leg.
+// ============================================================================
+
+// A remote running OLD code: band score, but a real distance on the wire.
+const fakeProxy = {
+  search: async () => ({
+    results: [{
+      id: 'REMOTE_DOC1', type: 'learning', content: 'remote vector doc',
+      source_file: 'fixture/remote1.md', concepts: [], project: null,
+      source: 'vector' as const, score: 0.99489, distance: 0.5123, model: 'bge-m3',
+    }],
+    total: 1, offset: 0, limit: 10,
+  }),
+  similar: async () => null, compare: async () => null, map: async () => null,
+  map3d: async () => null, stats: async () => null, available: async () => true,
+};
+
+mock.module('../vector-proxy.ts', () => ({
+  createVectorProxy: () => fakeProxy,
+}));
+
+// Widened type on purpose: a literal specifier would make tsc resolve
+// '../handlers.ts?leg=proxy' as a module path and fail the build.
+const HANDLERS_PROXY: string = '../handlers.ts?leg=proxy';
+const { handleSearch: handleSearchProxy } = await import(HANDLERS_PROXY);
+const { normalizeVectorDistance } = await import('../search-quality.ts');
+
+describe('proxy vector leg re-normalizes remote scores from distance', () => {
+  test('old-code remote band score 0.9949 is recomputed to 1 - d/2', async () => {
+    const res = await handleSearchProxy('remote vector doc', 'all', 10, 0, 'hybrid');
+    const hit = res.results.find((r: { id: string }) => r.id === 'REMOTE_DOC1');
+    expect(hit).toBeDefined();
+    expect(hit!.score).toBeCloseTo(normalizeVectorDistance(0.5123), 5); // 0.74385
+    expect(hit!.score).toBeLessThan(0.9); // the band can never come back through this leg
+  });
+
+  test('a remote result with NO distance scores 0 and surfaces a warning', async () => {
+    fakeProxy.search = (async () => ({
+      results: [{
+        id: 'REMOTE_NODIST', type: 'learning', content: 'no distance doc',
+        source_file: 'fixture/nodist.md', concepts: [], project: null,
+        source: 'vector' as const, score: 0.99, model: 'bge-m3',
+      }],
+      total: 1, offset: 0, limit: 10,
+    })) as never;
+    const res = await handleSearchProxy('no distance doc', 'all', 10, 0, 'hybrid');
+    const hit = res.results.find((r: { id: string }) => r.id === 'REMOTE_NODIST');
+    expect(hit).toBeDefined();
+    expect(hit!.score).toBe(0);
+    expect(res.warning ?? '').toContain('without a distance');
+  });
+});
