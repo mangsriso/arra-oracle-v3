@@ -37,6 +37,10 @@ jobs:
       - run: mkdir -p ~/.oracle
       - run: bun test:integration:db
       - run: bun test:integration:mcp
+      # tests/http/ boots its own isolated server per file
+      # (startIsolatedHttpServer picks a free loopback port, excludes 47778),
+      # so it needs no external server and runs before the shared one starts.
+      - run: bun run test:http
       - name: Start server for HTTP tests
         run: |
           ORACLE_CHROMA_TIMEOUT=2000 bun run src/server.ts &
