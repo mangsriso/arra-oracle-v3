@@ -9,7 +9,7 @@
 import { logSearch } from '../server/logging.ts';
 import { detectProject } from '../server/project-detect.ts';
 import { rerankCandidates } from '../server/reranker.ts';
-import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank } from '../server/search-quality.ts';
+import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank, sanitizeFtsQuery as sharedSanitizeFtsQuery } from '../server/search-quality.ts';
 import { ensureVectorStoreConnected } from '../vector/factory.ts';
 import { DISABLE_LOCAL_VECTOR } from '../config.ts';
 import type { SearchResult } from '../server/types.ts';
@@ -81,21 +81,14 @@ export const searchToolDef = {
 // ============================================================================
 
 /**
- * Sanitize FTS5 query to prevent parse errors.
- * Removes FTS5 special characters that cause syntax errors.
+ * Sanitize FTS5 query to prevent parse errors. Delegates to the shared
+ * token-quoting sanitizer (src/server/search-quality.ts) — the previous
+ * per-path deny-list let 14 characters through (=,[{$#%;&!@|<\) and the
+ * empty branch returned the RAW query; both crashed MATCH (fix 2026-08-22).
+ * Returns '' when the query has no searchable tokens — caller skips FTS.
  */
 export function sanitizeFtsQuery(query: string): string {
-  let sanitized = query
-    .replace(/[?*+\-()^~"':.\/]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!sanitized) {
-    console.error('[FTS5] Query became empty after sanitization:', query);
-    return query;
-  }
-
-  return sanitized;
+  return sharedSanitizeFtsQuery(query);
 }
 
 /**
@@ -430,30 +423,46 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
 
   let warning: string | undefined;
   let vectorSearchError = false;
+  let ftsError = false;
 
-  // Run FTS5 search (skip if vector-only mode)
+  // Run FTS5 search (skip if vector-only mode, or if sanitization left no
+  // searchable tokens — never send a raw/empty query to MATCH)
   let ftsRawResults: any[] = [];
-  if (mode !== 'vector') {
-    if (type === 'all') {
-      const stmt = ctx.sqlite.prepare(`
-        SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? ${projectFilter}
-        ORDER BY rank
-        LIMIT ?
-      `);
-      ftsRawResults = stmt.all(safeQuery, ...projectParams, limit * 2);
-    } else {
-      const stmt = ctx.sqlite.prepare(`
-        SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND d.type = ? ${projectFilter}
-        ORDER BY rank
-        LIMIT ?
-      `);
-      ftsRawResults = stmt.all(safeQuery, type, ...projectParams, limit * 2);
+  if (mode !== 'vector' && !safeQuery) {
+    warning = 'Query has no FTS-searchable tokens — FTS5 leg skipped.';
+  } else if (mode !== 'vector') {
+    try {
+      if (type === 'all') {
+        const stmt = ctx.sqlite.prepare(`
+          SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? ${projectFilter}
+          ORDER BY rank
+          LIMIT ?
+        `);
+        ftsRawResults = stmt.all(safeQuery, ...projectParams, limit * 2);
+      } else {
+        const stmt = ctx.sqlite.prepare(`
+          SELECT f.id, f.content, d.type, d.source_file, d.concepts, rank
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND d.type = ? ${projectFilter}
+          ORDER BY rank
+          LIMIT ?
+        `);
+        ftsRawResults = stmt.all(safeQuery, type, ...projectParams, limit * 2);
+      }
+    } catch (error) {
+      // Durable DEFECT-2 fallback: the sanitizer is not provably complete;
+      // an FTS5 parse failure must degrade to vector-only, not kill the
+      // search (live case 2026-08-22: "EfficientIP check=1 DHCP overwrite"
+      // errored in hybrid while vector mode found the right gotcha).
+      ftsError = true;
+      ftsRawResults = [];
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error('[FTS5]', msg);
+      warning = `FTS5 query failed: ${msg}.${mode === 'fts' ? '' : ' Returning vector-only results.'}`;
     }
   }
 
@@ -466,7 +475,7 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
   let vecResults: Awaited<ReturnType<typeof vectorSearch>> = [];
   if (mode !== 'fts' && DISABLE_LOCAL_VECTOR) {
     vectorSearchError = true;
-    warning = 'Local vector adapter disabled (ORACLE_DISABLE_LOCAL_VECTOR). Returning FTS5 results.';
+    warning = warning ? `${warning} Local vector adapter disabled (ORACLE_DISABLE_LOCAL_VECTOR).` : 'Local vector adapter disabled (ORACLE_DISABLE_LOCAL_VECTOR). Returning FTS5 results.';
   } else if (mode !== 'fts') {
     try {
       vecResults = await vectorSearch(ctx, query, type, limit * 2, model);
@@ -474,7 +483,7 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
       vectorSearchError = true;
       const errorMessage = error instanceof Error ? error.message : String(error);
       console.error('[ChromaDB]', errorMessage);
-      warning = `Vector search unavailable: ${errorMessage}. Using FTS5 only.`;
+      warning = warning ? `${warning} Vector search unavailable: ${errorMessage}.` : `Vector search unavailable: ${errorMessage}. Using FTS5 only.`;
     }
 
     if (vecResults.length === 0 && !vectorSearchError) {
@@ -584,6 +593,7 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     reranked?: boolean;
     rerankFallbackReason?: string;
     warning?: string;
+    ftsError?: boolean;
   } = {
     mode,
     limit,
@@ -598,6 +608,7 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
     deduped_removed: dedupPass.removed,
     reranked: reranked.reranked,
     ...(reranked.fallbackReason ? { rerankFallbackReason: reranked.fallbackReason } : {}),
+    ...(ftsError ? { ftsError: true } : {}),
   };
 
   if (warning) {

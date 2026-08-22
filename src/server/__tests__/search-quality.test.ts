@@ -5,7 +5,8 @@
 
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank } from '../search-quality.ts';
+import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank, sanitizeFtsQuery } from '../search-quality.ts';
+import { sanitizeFtsQuery as sanitizeFtsQueryFromToolsTwin } from '../../tools/search.ts';
 
 function makeDb(rows: Array<{ id: string; project?: string | null; superseded_by?: string | null }>) {
   const db = new Database(':memory:');
@@ -93,6 +94,38 @@ describe('normalizeBm25Rank', () => {
       const s = normalizeBm25Rank(r);
       expect(s).toBeGreaterThanOrEqual(0);
       expect(s).toBeLessThan(1);
+    }
+  });
+});
+
+describe('sanitizeFtsQuery', () => {
+  test('quotes every token as a phrase (implicit AND)', () => {
+    expect(sanitizeFtsQuery('force push safety')).toBe('"force" "push" "safety"');
+  });
+
+  test('doubles internal double-quotes', () => {
+    expect(sanitizeFtsQuery('say "hi"')).toBe('"say" """hi"""');
+  });
+
+  test('returns empty string for degenerate input — never the raw query', () => {
+    for (const q of ['???', '***', '"""', '...', '"', '=']) expect(sanitizeFtsQuery(q)).toBe('');
+  });
+
+  test('twin-parity: src/tools/search.ts sanitizeFtsQuery delegate stays byte-identical to the shared source', () => {
+    const queries = [
+      'force push safety',
+      'check=1',
+      'NOT this',
+      'ตรวจสอบ ก่อน push',
+      'v2.0.10',
+      'say "hi"',
+      '???',
+      '  hello   world  ',
+      'path/to/file',
+      'error: no such column',
+    ];
+    for (const q of queries) {
+      expect(sanitizeFtsQueryFromToolsTwin(q), `query ${JSON.stringify(q)}`).toBe(sanitizeFtsQuery(q));
     }
   });
 });

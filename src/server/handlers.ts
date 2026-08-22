@@ -14,7 +14,7 @@ import { logSearch, logDocumentAccess, logLearning } from './logging.ts';
 import type { SearchResult, SearchResponse } from './types.ts';
 import { ensureVectorStoreConnected, EMBEDDING_MODELS } from '../vector/factory.ts';
 import { detectProject } from './project-detect.ts';
-import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank } from './search-quality.ts';
+import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank, sanitizeFtsQuery } from './search-quality.ts';
 import { coerceConcepts } from '../tools/learn.ts';
 import { createVectorProxy } from './vector-proxy.ts';
 
@@ -39,21 +39,19 @@ export async function handleSearch(
   model?: string,    // Embedding model: 'bge-m3' (default, multilingual) or 'nomic' (fast)
   includeSuperseded: boolean = false,  // hidden by default; stored + flagged per P-001
   dedupChunksFlag: boolean = true      // collapse section chunks per (project, source_file)
-): Promise<SearchResponse & { mode?: string; warning?: string; model?: string; vectorAvailable?: boolean; superseded_hidden?: number; deduped_removed?: number }> {
+): Promise<SearchResponse & { mode?: string; warning?: string; model?: string; vectorAvailable?: boolean; ftsAvailable?: boolean; superseded_hidden?: number; deduped_removed?: number }> {
   // Auto-detect project from cwd if not explicitly specified
   const resolvedProject = (project ?? detectProject(cwd))?.toLowerCase() ?? null;
   const startTime = Date.now();
-  // Remove FTS5 special characters and HTML: ? * + - ( ) ^ ~ " ' : < > { } [ ] ; / \
-  const safeQuery = query
-    .replace(/<[^>]*>/g, ' ')           // Strip HTML tags
-    .replace(/[?*+\-()^~"':;<>{}[\]\\\/]/g, ' ')  // Strip FTS5 + SQL special chars
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!safeQuery) {
-    return { results: [], total: 0, limit, offset, query };
-  }
+  // Shared token-quoting FTS5 sanitizer (search-quality.ts). HTML tags are
+  // already stripped at the route layer (routes/search/search.ts:18,
+  // routes/vector/compare.ts:35) — no re-strip here; under quoting a tag is
+  // just a literal phrase token. Empty result => SKIP the FTS leg but keep
+  // the vector leg (the old early-return starved vector/hybrid modes too).
+  const safeQuery = sanitizeFtsQuery(query);
 
   let warning: string | undefined;
+  let ftsError = false;
 
   // FTS5 search (skip if vector-only mode)
   let ftsResults: SearchResult[] = [];
@@ -67,61 +65,72 @@ export async function handleSearch(
   const projectParams = resolvedProject ? [resolvedProject] : [];
 
   // FTS5 search must use raw SQL (Drizzle doesn't support virtual tables)
-  if (mode !== 'vector') {
-    if (type === 'all') {
-      const countStmt = sqlite.prepare(`
-        SELECT COUNT(*) as total
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND ${projectFilter}
-      `);
-      ftsTotal = (countStmt.get(safeQuery, ...projectParams) as { total: number }).total;
+  if (mode !== 'vector' && !safeQuery) {
+    warning = 'Query has no FTS-searchable tokens — FTS5 leg skipped.';
+  } else if (mode !== 'vector') {
+    try {
+      if (type === 'all') {
+        const countStmt = sqlite.prepare(`
+          SELECT COUNT(*) as total
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND ${projectFilter}
+        `);
+        ftsTotal = (countStmt.get(safeQuery, ...projectParams) as { total: number }).total;
 
-      const stmt = sqlite.prepare(`
-        SELECT f.id, f.content, d.type, d.source_file, d.concepts, d.project, rank as score
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND ${projectFilter}
-        ORDER BY rank
-        LIMIT ?
-      `);
-      ftsResults = stmt.all(safeQuery, ...projectParams, limit * 2).map((row: any) => ({
-        id: row.id,
-        type: row.type,
-        content: row.content,
-        source_file: row.source_file,
-        concepts: JSON.parse(row.concepts || '[]'),
-        project: row.project,
-        source: 'fts' as const,
-        score: normalizeRank(row.score)
-      }));
-    } else {
-      const countStmt = sqlite.prepare(`
-        SELECT COUNT(*) as total
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND d.type = ? AND ${projectFilter}
-      `);
-      ftsTotal = (countStmt.get(safeQuery, type, ...projectParams) as { total: number }).total;
+        const stmt = sqlite.prepare(`
+          SELECT f.id, f.content, d.type, d.source_file, d.concepts, d.project, rank as score
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND ${projectFilter}
+          ORDER BY rank
+          LIMIT ?
+        `);
+        ftsResults = stmt.all(safeQuery, ...projectParams, limit * 2).map((row: any) => ({
+          id: row.id,
+          type: row.type,
+          content: row.content,
+          source_file: row.source_file,
+          concepts: JSON.parse(row.concepts || '[]'),
+          project: row.project,
+          source: 'fts' as const,
+          score: normalizeRank(row.score)
+        }));
+      } else {
+        const countStmt = sqlite.prepare(`
+          SELECT COUNT(*) as total
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND d.type = ? AND ${projectFilter}
+        `);
+        ftsTotal = (countStmt.get(safeQuery, type, ...projectParams) as { total: number }).total;
 
-      const stmt = sqlite.prepare(`
-        SELECT f.id, f.content, d.type, d.source_file, d.concepts, d.project, rank as score
-        FROM oracle_fts f
-        JOIN oracle_documents d ON f.id = d.id
-        WHERE oracle_fts MATCH ? AND d.type = ? AND ${projectFilter}
-        ORDER BY rank
-        LIMIT ?
-      `);
-      ftsResults = stmt.all(safeQuery, type, ...projectParams, limit * 2).map((row: any) => ({
-        id: row.id,
-        type: row.type,
-        content: row.content,
-        source_file: row.source_file,
-        concepts: JSON.parse(row.concepts || '[]'),
-        project: row.project,
-        source: 'fts' as const,
-        score: normalizeRank(row.score)
-      }));
+        const stmt = sqlite.prepare(`
+          SELECT f.id, f.content, d.type, d.source_file, d.concepts, d.project, rank as score
+          FROM oracle_fts f
+          JOIN oracle_documents d ON f.id = d.id
+          WHERE oracle_fts MATCH ? AND d.type = ? AND ${projectFilter}
+          ORDER BY rank
+          LIMIT ?
+        `);
+        ftsResults = stmt.all(safeQuery, type, ...projectParams, limit * 2).map((row: any) => ({
+          id: row.id,
+          type: row.type,
+          content: row.content,
+          source_file: row.source_file,
+          concepts: JSON.parse(row.concepts || '[]'),
+          project: row.project,
+          source: 'fts' as const,
+          score: normalizeRank(row.score)
+        }));
+      }
+    } catch (error) {
+      ftsError = true;
+      ftsResults = [];
+      ftsTotal = 0;
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error('[FTS5]', msg);
+      warning = `FTS5 query failed: ${msg}.${mode === 'fts' ? '' : ' Returning vector-only results.'}`;
     }
   }
 
@@ -151,14 +160,14 @@ export async function handleSearch(
       vectorResults = remote.results || [];
     } else {
       vectorAvailable = false;
-      warning = 'Vector proxy unavailable — FTS5-only results';
+      warning = warning ? `${warning} Vector proxy unavailable.` : 'Vector proxy unavailable — FTS5-only results';
     }
   } else if (mode !== 'fts' && DISABLE_LOCAL_VECTOR) {
     // Local LanceDB adapter is disabled (host CPU lacks AVX2; LanceDB ≥0.27
     // emits AVX2 SIMD inside query() and crashes Bun with SIGILL). Skip the
     // vector leg entirely — return FTS5 results with vectorAvailable=false.
     vectorAvailable = false;
-    warning = 'Local vector adapter disabled (ORACLE_DISABLE_LOCAL_VECTOR) — FTS5-only results';
+    warning = warning ? `${warning} Local vector adapter disabled (ORACLE_DISABLE_LOCAL_VECTOR).` : 'Local vector adapter disabled (ORACLE_DISABLE_LOCAL_VECTOR) — FTS5-only results';
   } else if (mode !== 'fts') {
     // Determine which models to query
     const isMulti = model === 'multi';
@@ -308,6 +317,7 @@ export async function handleSearch(
     mode,
     ...(model === 'multi' ? { model: 'multi' } : model && EMBEDDING_MODELS[model] ? { model } : {}),
     ...(mode !== 'fts' ? { vectorAvailable } : {}),
+    ...(mode !== 'vector' ? { ftsAvailable: !ftsError } : {}),
     superseded_hidden: supersededPass.hidden,
     deduped_removed: dedupPass.removed,
     ...(warning && { warning })

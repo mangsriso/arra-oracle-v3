@@ -5,7 +5,9 @@
  * Contract (plan 2026-06-10 Track D): both paths apply the SAME dedup key and
  * SAME survivor rule. Scoring stays per-path (the two combine functions use
  * different algorithms by design) — except bm25-rank normalization, shared
- * via normalizeBm25Rank since 2026-08.
+ * via normalizeBm25Rank since 2026-08 — and, since 2026-08-22, FTS5 query
+ * sanitization via sanitizeFtsQuery (the deny-list era had two divergent
+ * per-path copies, both leaky).
  */
 
 import type { Database } from 'bun:sqlite';
@@ -21,6 +23,31 @@ import type { Database } from 'bun:sqlite';
 export function normalizeBm25Rank(rank: number): number {
   const absRank = Math.abs(rank);
   return absRank / (1 + absRank);
+}
+
+/**
+ * Sanitize arbitrary user/agent text into a query string that FTS5 MATCH is
+ * guaranteed to parse: every whitespace-delimited token becomes a quoted
+ * phrase ("…"), internal double-quotes doubled, control chars stripped
+ * (NUL breaks even a quoted string), tokens with no letter/digit dropped
+ * (they tokenize to nothing). Returns '' when nothing searchable remains —
+ * callers must then SKIP the FTS leg (never send the raw query; the
+ * 2026-01→08 deny-list era let 14 characters through per path and the MCP
+ * empty-branch returned the raw query, both killing the whole search).
+ *
+ * Semantics: quoted tokens are literal phrases — FTS5 operators
+ * (AND/OR/NOT/NEAR), column filters (col:term) and prefix (tok*) are
+ * deliberately neutralized. Porter stemming still applies inside phrases.
+ * Shared by both search twins (src/tools/search.ts sanitizeFtsQuery
+ * delegate, src/server/handlers.ts handleSearch) — keep ONE definition.
+ */
+export function sanitizeFtsQuery(query: string): string {
+  return query
+    .replace(/[\x00-\x1f\x7f]/g, ' ')
+    .split(/\s+/)
+    .filter((token) => /[\p{L}\p{N}]/u.test(token))
+    .map((token) => `"${token.replace(/"/g, '""')}"`)
+    .join(' ');
 }
 
 export interface QualityCandidate {

@@ -16,48 +16,39 @@ import {
 // ============================================================================
 
 describe('sanitizeFtsQuery', () => {
-  it('should remove FTS5 special characters', () => {
-    expect(sanitizeFtsQuery('hello?')).toBe('hello');
-    expect(sanitizeFtsQuery('test*')).toBe('test');
-    expect(sanitizeFtsQuery('a + b')).toBe('a b');
-    expect(sanitizeFtsQuery('NOT this')).toBe('NOT this');
+  it('quotes every token as a phrase (implicit AND)', () => {
+    expect(sanitizeFtsQuery('force push safety')).toBe('"force" "push" "safety"');
+    expect(sanitizeFtsQuery('oracle philosophy')).toBe('"oracle" "philosophy"');
   });
-
-  it('should handle quotes', () => {
-    expect(sanitizeFtsQuery('"exact phrase"')).toBe('exact phrase');
-    expect(sanitizeFtsQuery("it's a test")).toBe('it s a test');
+  it('preserves special-character tokens as searchable phrases (the check=1 class)', () => {
+    expect(sanitizeFtsQuery('check=1')).toBe('"check=1"');
+    expect(sanitizeFtsQuery('v2.0.10')).toBe('"v2.0.10"');
+    expect(sanitizeFtsQuery('192.168.1.1')).toBe('"192.168.1.1"');
+    expect(sanitizeFtsQuery('path/to/file')).toBe('"path/to/file"');
+    expect(sanitizeFtsQuery('error: no such column')).toBe('"error:" "no" "such" "column"');
   });
-
-  it('should normalize whitespace', () => {
-    expect(sanitizeFtsQuery('  hello   world  ')).toBe('hello world');
-    expect(sanitizeFtsQuery('a  b  c')).toBe('a b c');
+  it('doubles internal double-quotes (the only FTS5-special char inside a string)', () => {
+    expect(sanitizeFtsQuery('say "hi"')).toBe('"say" """hi"""');
   });
-
-  it('should handle empty result by returning original', () => {
-    expect(sanitizeFtsQuery('???')).toBe('???');
-    expect(sanitizeFtsQuery('***')).toBe('***');
+  it('neutralizes FTS5 operator keywords (leading NOT crashed MATCH under pass-through)', () => {
+    expect(sanitizeFtsQuery('NOT this')).toBe('"NOT" "this"');
+    expect(sanitizeFtsQuery('foo OR bar')).toBe('"foo" "OR" "bar"');
   });
-
-  it('should preserve valid queries', () => {
-    expect(sanitizeFtsQuery('oracle philosophy')).toBe('oracle philosophy');
-    expect(sanitizeFtsQuery('git safety')).toBe('git safety');
+  it('preserves Thai verbatim, including combining marks (U+0E48 is \\p{M})', () => {
+    expect(sanitizeFtsQuery('ตรวจสอบ ก่อน push')).toBe('"ตรวจสอบ" "ก่อน" "push"');
   });
-
-  it('should handle colons which break FTS5', () => {
-    expect(sanitizeFtsQuery('error: no such column')).toBe('error no such column');
-    expect(sanitizeFtsQuery('time: 15:30')).toBe('time 15 30');
+  it('normalizes whitespace', () => {
+    expect(sanitizeFtsQuery('  hello   world  ')).toBe('"hello" "world"');
   });
-
-  it('should handle forward slashes which break FTS5', () => {
-    expect(sanitizeFtsQuery('Shopee/Lazada/TikTok')).toBe('Shopee Lazada TikTok');
-    expect(sanitizeFtsQuery('path/to/file')).toBe('path to file');
+  it('drops tokens with no letter or digit', () => {
+    expect(sanitizeFtsQuery('-- force')).toBe('"force"');
+    expect(sanitizeFtsQuery('🔥 fire')).toBe('"fire"');
   });
-
-  it('should handle dots which break FTS5 query parser', () => {
-    expect(sanitizeFtsQuery('v2.0.10')).toBe('v2 0 10');
-    expect(sanitizeFtsQuery('oracle-v2.0.10')).toBe('oracle v2 0 10');
-    expect(sanitizeFtsQuery('192.168.1.1')).toBe('192 168 1 1');
-    expect(sanitizeFtsQuery('config.yaml')).toBe('config yaml');
+  it('returns empty string for degenerate input — NEVER the raw query', () => {
+    for (const q of ['???', '***', '"""', '...', '"', '=']) expect(sanitizeFtsQuery(q)).toBe('');
+  });
+  it('strips control characters (NUL breaks even a quoted FTS5 string)', () => {
+    expect(sanitizeFtsQuery('a\x00b c')).toBe('"a" "b" "c"');
   });
 });
 
