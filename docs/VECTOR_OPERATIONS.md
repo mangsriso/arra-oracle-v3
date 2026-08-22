@@ -75,3 +75,18 @@ for vector backends that do not expose a native revision.
   proxy layers engage from one env var.
 - `VECTOR_FALLBACK` (src/config.ts) is exported but read nowhere — the
   fts5-fallback behavior is hardcoded in handlers.ts.
+- **Known bug, must be settled before the first proxy deployment:** `offset`
+  is applied TWICE. handleSearch forwards `offset` to the remote
+  (handlers.ts, the `vectorProxy.search` call) and then slices the merged list
+  again with `combined.slice(offset, offset + limit)`. The remote has already
+  skipped those rows, so page 2 of a proxied `mode=vector` search comes back
+  empty. Predates the score-recompute work and is invisible today because no
+  deployment sets VECTOR_URL. Fix by picking ONE owner of the offset — not
+  forwarding it is the smaller change, since the FTS leg already fetches wide
+  and slices locally.
+- `remote.total` is discarded; the response reports the locally merged total.
+  Pagination metadata from a proxied search therefore describes this node's
+  merge, not the remote's corpus.
+- The remote's `distance` is trusted to be in the dot-distance domain [0, 2].
+  A negative distance clamps to a perfect 1.0 with no warning — the score is
+  recomputed locally, but the input to that computation is not validated.

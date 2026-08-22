@@ -170,4 +170,26 @@ describe('proxy vector leg re-normalizes remote scores from distance', () => {
     expect(hit!.score).toBe(0);
     expect(res.warning ?? '').toContain('without a distance');
   });
+
+  // Kills the `?? 2` -> `|| 2` mutation, which the suite otherwise survives.
+  // A remote hit with a GENUINE distance of 0 is an exact duplicate and must
+  // keep its perfect 1.0; `||` would read that 0 as absent, substitute the
+  // sentinel, and score the best possible match as the worst — the same
+  // swallows-a-real-zero class this line's `??` was chosen to avoid
+  // (see 12a2124, which fixed exactly that on the local leg).
+  test('a remote hit with a GENUINE distance of 0 keeps the perfect 1.0', async () => {
+    fakeProxy.search = (async () => ({
+      results: [{
+        id: 'REMOTE_DUP', type: 'learning', content: 'exact duplicate doc',
+        source_file: 'fixture/dup.md', concepts: [], project: null,
+        source: 'vector' as const, score: 1, distance: 0, model: 'bge-m3',
+      }],
+      total: 1, offset: 0, limit: 10,
+    })) as never;
+    const res = await handleSearchProxy('exact duplicate doc', 'all', 10, 0, 'hybrid');
+    const hit = res.results.find((r: { id: string }) => r.id === 'REMOTE_DUP');
+    expect(hit).toBeDefined();
+    expect(hit!.score).toBe(1);
+    expect(res.warning ?? '').not.toContain('without a distance');
+  });
 });
