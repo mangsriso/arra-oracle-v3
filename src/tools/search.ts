@@ -214,10 +214,21 @@ export async function vectorSearch(
       source: 'vector';
     }> = [];
 
+    let unmeasured = 0;
     for (let i = 0; i < results.ids.length; i++) {
       const metadata = results.metadatas[i] as Record<string, unknown> | null;
 
-      const rawDistance = results.distances[i] || 0;
+      // The wire gives no guarantee every id has a distance — adapters can
+      // return a short or holed array. `|| 0` turned that absence into
+      // distance 0, which the normalize step in handleSearch inverts to a
+      // PERFECT 1.0, so an unknown distance outranked every measured match
+      // (the defect 12a2124 closed on the HTTP twin). Sentinel 2 = the worst
+      // measurable dot-distance: unknown never outranks measured. This path
+      // has no shared normalizer with a finite-guard, so the guard lives here.
+      const wireDistance: number | undefined = results.distances[i];
+      const measured = typeof wireDistance === 'number' && Number.isFinite(wireDistance);
+      if (!measured) unmeasured++;
+      const rawDistance = measured ? wireDistance : 2;
       mappedResults.push({
         id: results.ids[i],
         type: (metadata?.type as string) || 'unknown',
@@ -229,6 +240,10 @@ export async function vectorSearch(
         model: resolvedModelName,
         source: 'vector',
       });
+    }
+
+    if (unmeasured > 0) {
+      console.error(`[VectorSearch] ${unmeasured}/${results.ids.length} result(s) without a finite distance — scored as worst (distance sentinel 2)`);
     }
 
     // The DB is the authority for source_file, not the vector metadata.
@@ -505,7 +520,12 @@ export async function handleSearch(ctx: ToolContext, input: OracleSearchInput): 
   // Normalize vector scores (ChromaDB distances: lower = better → invert)
   const normalizedVectorResults = vecResults.map((result) => ({
     ...result,
-    score: 1 - (result.score || 0),
+    // result.score is a raw distance and is always finite here (vectorSearch
+    // guards the wire value with the sentinel-2 fallback). The old `|| 0`
+    // turned a missing distance into a perfect 1.0 — the 12a2124 defect on
+    // this twin. Plain arithmetic keeps a genuine distance of 0 (exact
+    // duplicate) at a perfect 1.
+    score: 1 - result.score,
   }));
 
   const combinedResults = combineResults(ftsResults, normalizedVectorResults);
