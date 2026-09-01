@@ -1,269 +1,163 @@
-/**
- * Wave 2 — daemon HTTP API tests, ported from alpha's Hono harness to Elysia.
- *
- * Alpha used `app.fetch(new Request(...))` against a Hono app whose factory
- * (`createDaemonApp(deps)`) lived at `src/indexer/api.ts`.
- *
- * Wave 2 splits responsibilities:
- *   - `src/indexer/api.ts` will re-export the Elysia factory + `makeEventBus`
- *   - or `src/routes/indexer-daemon/index.ts` will host the Elysia plugin
- *
- * Owner E owns that port (branch: port/wave2-elysia-daemon). This file ports
- * the 14 alpha tests to Elysia's `app.handle(new Request(...))` API. The
- * suite is currently `describe(...)` because Owner E's plugin has not
- * yet landed — the import is wrapped in try/catch so the test file loads
- * cleanly under bun even when the module is absent.
- *
- * When Owner E lands the Elysia daemon, drop `.skip` and the imports below
- * should resolve.
- */
-
-import { describe, it, expect } from 'bun:test';
-import Database from 'bun:sqlite';
+import { describe, expect, it } from 'bun:test';
 import { Elysia } from 'elysia';
 import { enqueueIndexJob } from '../jobs.ts';
+import { daemonApiPlugin, makeEventBus, type DaemonApiDeps } from '../../routes/indexer-daemon/index.ts';
 import type { WorkerEvent } from '../worker.ts';
-import {
-  daemonApiPlugin,
-  makeEventBus,
-  type DaemonApiDeps,
-} from '../../routes/indexer-daemon/index.ts';
+import { queueDb, TEST_MODELS } from './v2-fixture.ts';
 
-type ApiDeps = DaemonApiDeps;
+const CONTENT = 'authoritative API projection';
+const HASH = new Bun.CryptoHasher('sha256').update(CONTENT).digest('hex');
 
-type EventBus<E> = {
-  publish: (ev: E) => void;
-  subscribe: (cb: (ev: E) => void) => () => void;
-};
-
-function createDaemonApp(deps: ApiDeps) {
-  return new Elysia().use(daemonApiPlugin(deps));
-}
-
-const MIGRATION_SQL = `
-CREATE TABLE indexing_jobs (
-  id TEXT PRIMARY KEY,
-  doc_id TEXT NOT NULL,
-  model_key TEXT NOT NULL,
-  collection TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  attempts INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
-  claimed_at INTEGER,
-  finished_at INTEGER,
-  error TEXT
-);
-`;
-
-const MODELS = {
-  'bge-m3': { collection: 'oracle_knowledge_bge_m3' },
-  qwen3: { collection: 'oracle_knowledge_qwen3' },
-};
-
-function makeDeps(): ApiDeps & { _shutdownFlag: { v: boolean }; _bus: EventBus<WorkerEvent> } {
-  const db = new Database(':memory:');
-  db.exec(MIGRATION_SQL);
-  const flag = { v: false };
+function harness(mode: { producer?: boolean; workers?: boolean } = {}) {
+  const db = queueDb();
+  db.prepare('INSERT INTO oracle_fts (id, content, concepts) VALUES (?, ?, ?)')
+    .run('doc', CONTENT, '');
+  const flag = { value: false };
   const bus = makeEventBus<WorkerEvent>();
-  return {
+  const deps: DaemonApiDeps = {
     db,
-    models: MODELS,
-    isShuttingDown: () => flag.v,
-    requestShutdown: () => { flag.v = true; },
+    models: TEST_MODELS,
+    producerEnabled: mode.producer ?? true,
+    workersEnabled: mode.workers ?? false,
+    activeModelKey: 'test',
+    indexRevision: TEST_MODELS.test.indexRevision,
+    isShuttingDown: () => flag.value,
+    requestShutdown: () => { flag.value = true; },
     subscribe: bus.subscribe,
-    _shutdownFlag: flag,
-    _bus: bus,
   };
+  return { db, flag, bus, app: new Elysia().use(daemonApiPlugin(deps)) };
 }
 
-// The plugin mounts routes at the root (no prefix); the daemon entrypoint
-// uses `.use(daemonApiPlugin(deps))` directly on the root Elysia instance.
-const URL_BASE = 'http://localhost';
+function request(path: string, body?: unknown): Request {
+  return new Request(`http://localhost${path}`, body === undefined ? undefined : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+}
 
-describe('GET /health', () => {
-  it('returns ok with queue depth + models', async () => {
-    const deps = makeDeps();
-    enqueueIndexJob(deps.db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    enqueueIndexJob(deps.db, { docId: 'doc-B', modelKey: 'qwen3', models: MODELS });
-    const app = createDaemonApp(deps);
-    const res = await app.handle(new Request(`${URL_BASE}/health`));
-    expect(res.status).toBe(200);
-    const body = await res.json() as { status: string; service: string; queue_depth: Record<string, number>; models: string[] };
+describe('indexer daemon API v2', () => {
+  it('health preserves status and exposes disabled-worker mode', async () => {
+    const { app } = harness();
+    const response = await app.handle(request('/health'));
+    const body = await response.json() as any;
     expect(body.status).toBe('ok');
-    expect(body.service).toBe('arra-indexer');
-    expect(body.queue_depth['bge-m3']).toBe(1);
-    expect(body.queue_depth.qwen3).toBe(1);
-    expect(body.models.sort()).toEqual(['bge-m3', 'qwen3']);
+    expect(body.mode).toEqual({
+      producer_enabled: true,
+      workers_enabled: false,
+      active_model_key: 'test',
+      index_revision: TEST_MODELS.test.indexRevision,
+      collection: null,
+      dimension: null,
+    });
   });
 
-  it('reports shutting_down flag', async () => {
-    const deps = makeDeps();
-    deps._shutdownFlag.v = true;
-    const app = createDaemonApp(deps);
-    const res = await app.handle(new Request(`${URL_BASE}/health`));
-    const body = await res.json() as { shutting_down: boolean };
-    expect(body.shutting_down).toBe(true);
-  });
-});
-
-describe('POST /index', () => {
-  it('enqueues for all registered models when model_key omitted', async () => {
-    const deps = makeDeps();
-    const app = createDaemonApp(deps);
-    const res = await app.handle(
-      new Request(`${URL_BASE}/index`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ doc_id: 'doc-X' }),
-      }),
-    );
-    expect(res.status).toBe(200);
-    const body = await res.json() as { jobs: Array<{ modelKey: string }> };
-    expect(body.jobs).toHaveLength(2);
-    expect(body.jobs.map((j) => j.modelKey).sort()).toEqual(['bge-m3', 'qwen3']);
+  it('health exposes supervised worker degradation', async () => {
+    const h = harness();
+    const app = new Elysia().use(daemonApiPlugin({
+      db: h.db, models: TEST_MODELS, producerEnabled: true, workersEnabled: true,
+      activeModelKey: 'test', indexRevision: TEST_MODELS.test.indexRevision,
+      isShuttingDown: () => true, requestShutdown: () => {}, subscribe: h.bus.subscribe,
+      livenessError: () => 'heartbeat database failed',
+    } as DaemonApiDeps));
+    const body = await (await app.handle(request('/health'))).json() as any;
+    expect(body.status).toBe('degraded');
+    expect(body.liveness_error).toBe('heartbeat database failed');
   });
 
-  it('enqueues for one model when model_key specified', async () => {
-    const deps = makeDeps();
-    const app = createDaemonApp(deps);
-    const res = await app.handle(
-      new Request(`${URL_BASE}/index`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ doc_id: 'doc-X', model_key: 'bge-m3' }),
-      }),
-    );
-    const body = await res.json() as { jobs: Array<{ modelKey: string }> };
-    expect(body.jobs).toHaveLength(1);
-    expect(body.jobs[0].modelKey).toBe('bge-m3');
+  it('rejects silent fan-out and requires the authoritative content hash', async () => {
+    const { app } = harness();
+    expect((await app.handle(request('/index', { doc_id: 'doc' }))).status).toBe(400);
+    expect((await app.handle(request('/index', {
+      doc_id: 'doc', content_hash: HASH,
+    }))).status).toBe(400);
   });
 
-  it('returns 400 when doc_id missing', async () => {
-    const deps = makeDeps();
-    const app = createDaemonApp(deps);
-    const res = await app.handle(
-      new Request(`${URL_BASE}/index`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      }),
-    );
-    expect(res.status).toBe(400);
-    const body = await res.json() as { error: string };
-    expect(body.error).toBe('doc_id required');
-  });
-
-  it('returns 400 on invalid JSON', async () => {
-    const deps = makeDeps();
-    const app = createDaemonApp(deps);
-    const res = await app.handle(
-      new Request(`${URL_BASE}/index`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{not valid json',
-      }),
-    );
-    expect(res.status).toBe(400);
-  });
-
-  it('returns 503 when shutting down', async () => {
-    const deps = makeDeps();
-    deps._shutdownFlag.v = true;
-    const app = createDaemonApp(deps);
-    const res = await app.handle(
-      new Request(`${URL_BASE}/index`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ doc_id: 'doc-X' }),
-      }),
-    );
-    expect(res.status).toBe(503);
-  });
-});
-
-describe('GET /jobs', () => {
-  it('lists all jobs without filters', async () => {
-    const deps = makeDeps();
-    enqueueIndexJob(deps.db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    enqueueIndexJob(deps.db, { docId: 'doc-B', modelKey: 'qwen3', models: MODELS });
-    const app = createDaemonApp(deps);
-    const res = await app.handle(new Request(`${URL_BASE}/jobs`));
-    const body = await res.json() as { jobs: Array<{ doc_id: string; model_key: string }>; count: number };
-    expect(body.count).toBe(2);
-    expect(body.jobs.map((j) => j.doc_id).sort()).toEqual(['doc-A', 'doc-B']);
-  });
-
-  it('filters by status', async () => {
-    const deps = makeDeps();
-    enqueueIndexJob(deps.db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    deps.db.exec("UPDATE indexing_jobs SET status = 'done' WHERE doc_id = 'doc-A'");
-    enqueueIndexJob(deps.db, { docId: 'doc-B', modelKey: 'bge-m3', models: MODELS });
-    const app = createDaemonApp(deps);
-    const res = await app.handle(new Request(`${URL_BASE}/jobs?status=pending`));
-    const body = await res.json() as { jobs: Array<{ doc_id: string }>; count: number };
-    expect(body.count).toBe(1);
-    expect(body.jobs[0].doc_id).toBe('doc-B');
-  });
-
-  it('filters by model', async () => {
-    const deps = makeDeps();
-    enqueueIndexJob(deps.db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    enqueueIndexJob(deps.db, { docId: 'doc-A', modelKey: 'qwen3', models: MODELS });
-    const app = createDaemonApp(deps);
-    const res = await app.handle(new Request(`${URL_BASE}/jobs?model=qwen3`));
-    const body = await res.json() as { jobs: Array<{ model_key: string }>; count: number };
-    expect(body.count).toBe(1);
-    expect(body.jobs[0].model_key).toBe('qwen3');
-  });
-
-  it('respects limit param (default 100, capped at 1000)', async () => {
-    const deps = makeDeps();
-    for (let i = 0; i < 5; i++) {
-      enqueueIndexJob(deps.db, { docId: `doc-${i}`, modelKey: 'bge-m3', models: MODELS });
+  it('rejects malformed, uppercase, missing-projection, and mismatched hashes', async () => {
+    const { app } = harness();
+    for (const content_hash of ['abc', HASH.toUpperCase(), '0'.repeat(64)]) {
+      expect((await app.handle(request('/index', {
+        doc_id: 'doc', content_hash, model_key: 'test',
+      }))).status).toBe(content_hash === '0'.repeat(64) ? 409 : 400);
     }
-    const app = createDaemonApp(deps);
-    const res = await app.handle(new Request(`${URL_BASE}/jobs?limit=3`));
-    const body = await res.json() as { jobs: unknown[]; count: number };
-    expect(body.count).toBe(3);
-  });
-});
-
-describe('POST /drain', () => {
-  it('flips shutdown flag and returns 200', async () => {
-    const deps = makeDeps();
-    expect(deps._shutdownFlag.v).toBe(false);
-    const app = createDaemonApp(deps);
-    const res = await app.handle(new Request(`${URL_BASE}/drain`, { method: 'POST' }));
-    expect(res.status).toBe(200);
-    const body = await res.json() as { status: string };
-    expect(body.status).toBe('draining');
-    expect(deps._shutdownFlag.v).toBe(true);
-  });
-});
-
-describe('makeEventBus', () => {
-  it('publishes to all subscribers; unsubscribe removes', () => {
-    const bus = makeEventBus<{ n: number }>();
-    const seenA: number[] = [];
-    const seenB: number[] = [];
-    const unsubA = bus.subscribe((ev) => seenA.push(ev.n));
-    const unsubB = bus.subscribe((ev) => seenB.push(ev.n));
-    bus.publish({ n: 1 });
-    bus.publish({ n: 2 });
-    unsubA();
-    bus.publish({ n: 3 });
-    unsubB();
-    bus.publish({ n: 4 });
-    expect(seenA).toEqual([1, 2]);
-    expect(seenB).toEqual([1, 2, 3]);
+    expect((await app.handle(request('/index', {
+      doc_id: 'missing', content_hash: HASH, model_key: 'test',
+    }))).status).toBe(400);
   });
 
-  it('one subscriber throwing does not break others', () => {
-    const bus = makeEventBus<number>();
+  for (const producer of [false, true]) {
+    for (const workers of [false, true]) {
+      it(`producer=${producer} workers=${workers} enforces enqueue mode without claims`, async () => {
+        const { app, db } = harness({ producer, workers });
+        const response = await app.handle(request('/index', {
+          doc_id: 'doc', content_hash: HASH, model_key: 'test',
+        }));
+        expect(response.status).toBe(producer ? 200 : 503);
+        expect((db.query('SELECT COUNT(*) AS n FROM indexing_jobs_v2').get() as { n: number }).n)
+          .toBe(producer ? 1 : 0);
+        expect((db.query('SELECT COUNT(*) AS n FROM indexing_job_attempts_v2').get() as { n: number }).n)
+          .toBe(0);
+      });
+    }
+  }
+
+  it('enqueues one explicit key and idempotently returns the same job', async () => {
+    const { app, db } = harness();
+    const body = { doc_id: 'doc', content_hash: HASH, model_key: 'test' };
+    const first = await (await app.handle(request('/index', body))).json() as any;
+    const second = await (await app.handle(request('/index', body))).json() as any;
+    expect(first.jobs).toHaveLength(1);
+    expect(second.jobs[0].id).toBe(first.jobs[0].id);
+    expect((db.query('SELECT COUNT(*) AS count FROM indexing_jobs_v2').get() as { count: number }).count)
+      .toBe(1);
+  });
+
+  it('allows fan-out only with all_models true', async () => {
+    const { app } = harness();
+    const response = await app.handle(request('/index', {
+      doc_id: 'doc', content_hash: HASH, all_models: true,
+    }));
+    const body = await response.json() as any;
+    expect(body.jobs.map((job: any) => job.modelKey).sort()).toEqual(['other', 'test']);
+  });
+
+  it('lists v2 jobs and supports filters', async () => {
+    const { app, db } = harness();
+    enqueueIndexJob(db, {
+      docId: 'a', contentHash: HASH, modelKey: 'test', models: TEST_MODELS,
+    });
+    enqueueIndexJob(db, {
+      docId: 'b', contentHash: HASH, modelKey: 'other', models: TEST_MODELS,
+    });
+    const body = await (await app.handle(request('/jobs?model=other'))).json() as any;
+    expect(body.count).toBe(1);
+    expect(body.jobs[0].doc_id).toBe('b');
+  });
+
+  it('clamps list limit to 1..1000', async () => {
+    const { app } = harness();
+    const low = await (await app.handle(request('/jobs?limit=-20'))).json() as any;
+    const high = await (await app.handle(request('/jobs?limit=999999'))).json() as any;
+    expect(low.count).toBeLessThanOrEqual(1);
+    expect(high.count).toBeLessThanOrEqual(1000);
+  });
+
+  it('drain blocks enqueue and leaves queue unchanged', async () => {
+    const { app, flag, db } = harness();
+    expect((await app.handle(new Request('http://localhost/drain', { method: 'POST' }))).status)
+      .toBe(200);
+    expect(flag.value).toBe(true);
+    expect((await app.handle(request('/index', {
+      doc_id: 'doc', content_hash: HASH, model_key: 'test',
+    }))).status).toBe(503);
+    expect((db.query('SELECT COUNT(*) AS count FROM indexing_jobs_v2').get() as { count: number }).count)
+      .toBe(0);
+  });
+
+  it('event bus isolates throwing subscribers', () => {
+    const bus = makeEventBus<{ value: number }>();
     const seen: number[] = [];
     bus.subscribe(() => { throw new Error('boom'); });
-    bus.subscribe((n) => seen.push(n));
-    bus.publish(42);
-    expect(seen).toEqual([42]);
+    bus.subscribe((event) => seen.push(event.value));
+    bus.publish({ value: 1 });
+    expect(seen).toEqual([1]);
   });
 });

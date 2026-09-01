@@ -64,9 +64,10 @@ assertSafeTestRuntime(process.env, systemTmpDir);
 
 const realFetch = globalThis.fetch.bind(globalThis);
 const allowedLoopbackPorts = new Map<number, number>();
+const forbiddenTestPorts = new Set([47778, 47779, 11434]);
 const networkRegistry = {
   allow(port: number) {
-    if (!Number.isInteger(port) || port <= 0 || port > 65_535 || port === 47778) {
+    if (!Number.isInteger(port) || port <= 0 || port > 65_535 || forbiddenTestPorts.has(port)) {
       throw new Error(`[test-safety] refusing unsafe test port registration: ${port}`);
     }
     allowedLoopbackPorts.set(port, (allowedLoopbackPorts.get(port) || 0) + 1);

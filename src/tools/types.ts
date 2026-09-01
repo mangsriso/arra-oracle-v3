@@ -54,6 +54,7 @@ export interface OracleLearnInput {
   source?: string;
   concepts?: string[];
   project?: string;
+  idempotency_key?: string;
 }
 
 export interface OracleListInput {

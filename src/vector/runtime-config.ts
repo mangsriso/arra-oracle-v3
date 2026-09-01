@@ -12,6 +12,7 @@ import type { EmbeddingProviderType } from './types.ts';
 export interface EmbeddingRuntime {
   provider: EmbeddingProviderType;
   model: string;
+  supportsAbort: boolean;
 }
 
 const EMBEDDING_PROVIDERS = new Set<EmbeddingProviderType>([
@@ -38,5 +39,6 @@ export function resolveEmbeddingRuntime(
   return {
     provider: embeddingProvider(provider),
     model,
+    supportsAbort: provider !== 'chromadb-internal',
   };
 }

@@ -6,6 +6,7 @@
  */
 
 import type { EmbeddingProvider, EmbeddingProviderType } from './types.ts';
+import { EmbeddingProviderHttpError } from './provider-error.ts';
 
 /**
  * Placeholder for ChromaDB's internal embeddings.
@@ -14,6 +15,7 @@ import type { EmbeddingProvider, EmbeddingProviderType } from './types.ts';
 export class ChromaDBInternalEmbeddings implements EmbeddingProvider {
   readonly name = 'chromadb-internal';
   readonly dimensions = 384; // all-MiniLM-L6-v2 default
+  readonly supportsAbort = false;
 
   async embed(_texts: string[]): Promise<number[][]> {
     throw new Error('ChromaDB handles embeddings internally. Use addDocuments() directly.');
@@ -25,7 +27,9 @@ export class ChromaDBInternalEmbeddings implements EmbeddingProvider {
  */
 export class OllamaEmbeddings implements EmbeddingProvider {
   readonly name = 'ollama';
+  readonly supportsAbort = true;
   dimensions: number;
+  readonly dimensionKnown: boolean;
   private baseUrl: string;
   private model: string;
   private _dimensionsDetected = false;
@@ -41,10 +45,12 @@ export class OllamaEmbeddings implements EmbeddingProvider {
       'mxbai-embed-large': 1024,
       'all-minilm': 384,
     };
+    this.dimensionKnown = this.model in KNOWN_DIMS;
+    // Keep generic legacy callers compatible; A2 uses dimensionKnown/probes.
     this.dimensions = KNOWN_DIMS[this.model] || 768;
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
+  async embed(texts: string[], _type?: 'query' | 'passage', signal?: AbortSignal): Promise<number[][]> {
     const embeddings: number[][] = [];
 
     for (const text of texts) {
@@ -54,11 +60,12 @@ export class OllamaEmbeddings implements EmbeddingProvider {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: this.model, prompt: truncated }),
+        signal,
       });
 
       if (!response.ok) {
         const error = await response.text();
-        throw new Error(`Ollama API error: ${error}`);
+        throw new EmbeddingProviderHttpError(response.status, `Ollama API error: ${error}`);
       }
 
       const data = await response.json() as { embedding: number[] };
@@ -80,6 +87,7 @@ export class OllamaEmbeddings implements EmbeddingProvider {
  */
 export class OpenAIEmbeddings implements EmbeddingProvider {
   readonly name = 'openai';
+  readonly supportsAbort = true;
   readonly dimensions: number;
   private apiKey: string;
   private model: string;
@@ -104,7 +112,7 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
     }
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
+  async embed(texts: string[], _type?: 'query' | 'passage', signal?: AbortSignal): Promise<number[][]> {
     const response = await fetch(`${this.baseUrl}/embeddings`, {
       method: 'POST',
       headers: {
@@ -112,11 +120,12 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ input: texts, model: this.model }),
+      signal,
     });
 
     if (!response.ok) {
       const error = await response.text();
-      throw new Error(`OpenAI API error: ${error}`);
+      throw new EmbeddingProviderHttpError(response.status, `OpenAI API error: ${error}`);
     }
 
     const data = await response.json() as {

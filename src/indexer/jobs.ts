@@ -1,27 +1,26 @@
-/**
- * Indexer job-queue helpers — M1 of the indexer-CLI design.
- *
- * Synchronous SQLite operations against the `indexing_jobs` table. No
- * embedding, no Ollama, no LanceDB. Just queue plumbing — the daemon
- * (M2) is what does the actual work.
- *
- * Plug-and-play invariants:
- *   - One row per (doc_id, model_key) — adding a model adds queue entries,
- *     never touches oracle_documents or other models' collections
- *   - claimNextJob() is atomic via UPDATE...RETURNING with WHERE status filter
- *   - markJobError() preserves the row (no destruction); attempts increments
- *
- * Design rationale: ψ/lab/indexer-cli/DESIGN.md in arra-mcp-installation-guide-oracle
- */
-
 import type Database from 'bun:sqlite';
+
+export const MAX_JOB_ATTEMPTS = 3;
+export const DEFAULT_LEASE_MS = 90_000;
+export const RETRY_DELAYS_MS = [5_000, 30_000] as const;
+
+export type JobStatus =
+  | 'pending' | 'claimed' | 'retry_wait' | 'done' | 'failed_permanent'
+  | 'exhausted' | 'skipped_missing' | 'superseded'
+  | 'blocked_projection' | 'cancelled';
+
+export interface QueueModel {
+  collection: string;
+  indexRevision: string;
+}
 
 export interface EnqueueOptions {
   docId: string;
-  /** If omitted → enqueue for ALL models in the registry (typical arra_learn case). */
+  contentHash: string;
   modelKey?: string;
-  /** Registry of model_key → collection. Caller passes this in (no global state). */
-  models: Record<string, { collection: string }>;
+  allModels?: boolean;
+  models: Record<string, QueueModel>;
+  now?: number;
 }
 
 export interface EnqueuedJob {
@@ -29,107 +28,146 @@ export interface EnqueuedJob {
   docId: string;
   modelKey: string;
   collection: string;
+  contentHash: string;
+  indexRevision: string;
+  status: JobStatus;
+  attempts: number;
+  claimToken?: string;
+  leaseUntil?: number;
 }
 
-const RANDOM_SUFFIX_LENGTH = 6;
-
-function jobId(modelKey: string): string {
-  // "idx-<ms>-<modelKey>-<rand>" — short, sortable, unique enough for our scale.
-  const safe = modelKey.replace(/[^a-z0-9]/gi, '');
-  const rand = Math.random().toString(36).slice(2, 2 + RANDOM_SUFFIX_LENGTH);
-  return `idx-${Date.now()}-${safe}-${rand}`;
+function hash(value: string): string {
+  return new Bun.CryptoHasher('sha256').update(value).digest('hex');
 }
 
-/**
- * Insert one or more job rows. Returns the rows that were inserted.
- *
- * For unset `modelKey`, inserts one row per entry in `models`. For a specified
- * `modelKey` not in `models`, returns [] (nothing to enqueue — caller's choice
- * to fail loudly or silently).
- */
+export function logicalJobId(docId: string, modelKey: string, contentHash: string, revision: string): string {
+  return `idx2-${hash(JSON.stringify([docId, modelKey, contentHash, revision])).slice(0, 32)}`;
+}
+
 export function enqueueIndexJob(db: Database, opts: EnqueueOptions): EnqueuedJob[] {
-  const targets: Array<{ key: string; collection: string }> = opts.modelKey
-    ? opts.models[opts.modelKey]
-      ? [{ key: opts.modelKey, collection: opts.models[opts.modelKey].collection }]
-      : []
-    : Object.entries(opts.models).map(([key, { collection }]) => ({ key, collection }));
-
-  if (targets.length === 0) return [];
-
-  const stmt = db.prepare(
-    `INSERT INTO indexing_jobs (id, doc_id, model_key, collection, status, attempts)
-     VALUES (?, ?, ?, ?, 'pending', 0)`,
-  );
-
+  if ((!opts.modelKey && !opts.allModels) || (opts.modelKey && opts.allModels)) {
+    throw new Error('Specify exactly one modelKey, or explicit allModels: true');
+  }
+  const targets = opts.modelKey
+    ? [[opts.modelKey, opts.models[opts.modelKey]]] as const
+    : Object.entries(opts.models);
+  if (targets.length === 0) throw new Error('No embedding models are configured');
+  const now = opts.now ?? Date.now();
   const out: EnqueuedJob[] = [];
-  for (const { key, collection } of targets) {
-    const id = jobId(key);
-    stmt.run(id, opts.docId, key, collection);
-    out.push({ id, docId: opts.docId, modelKey: key, collection });
+  const insert = db.prepare(`
+    INSERT INTO indexing_jobs_v2
+      (id, doc_id, model_key, collection, content_hash, index_revision,
+       status, attempts, created_at, next_attempt_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+    ON CONFLICT(doc_id, model_key, content_hash, index_revision) DO NOTHING
+  `);
+  const select = db.query<{
+    id: string; doc_id: string; model_key: string; collection: string;
+    content_hash: string; index_revision: string; status: JobStatus; attempts: number;
+  }, [string, string, string, string]>(`
+    SELECT id, doc_id, model_key, collection, content_hash, index_revision, status, attempts
+    FROM indexing_jobs_v2
+    WHERE doc_id = ? AND model_key = ? AND content_hash = ? AND index_revision = ?
+  `);
+  for (const [modelKey, model] of targets) {
+    if (!model) throw new Error(`Unknown model_key: ${modelKey}`);
+    if (!model.indexRevision) throw new Error(`Missing index revision for model_key: ${modelKey}`);
+    const id = logicalJobId(opts.docId, modelKey, opts.contentHash, model.indexRevision);
+    insert.run(id, opts.docId, modelKey, model.collection, opts.contentHash, model.indexRevision, now, now);
+    const row = select.get(opts.docId, modelKey, opts.contentHash, model.indexRevision);
+    if (!row) throw new Error(`Failed to enqueue logical job for model_key: ${modelKey}`);
+    if (row.collection !== model.collection) {
+      throw new Error(`Logical job collection mismatch for model_key: ${modelKey}`);
+    }
+    out.push({
+      id: row.id, docId: row.doc_id, modelKey: row.model_key,
+      collection: row.collection, contentHash: row.content_hash,
+      indexRevision: row.index_revision, status: row.status, attempts: row.attempts,
+    });
   }
   return out;
 }
 
-/**
- * Atomically claim the next pending job for a worker.
- * Uses UPDATE…RETURNING so SQLite gives us exactly one row even under
- * concurrent claimers (only one wins per row).
- *
- * Returns null when the queue is empty for that model.
- */
-export function claimNextJob(db: Database, modelKey: string): EnqueuedJob | null {
-  // SQLite supports UPDATE … RETURNING since 3.35. Bun ships a new-enough sqlite.
-  const row = db
-    .query<
-      {
-        id: string;
-        doc_id: string;
-        model_key: string;
-        collection: string;
-      },
-      [string]
-    >(
-      `UPDATE indexing_jobs
-       SET status = 'claimed', claimed_at = (strftime('%s','now')*1000), attempts = attempts + 1
-       WHERE id = (
-         SELECT id FROM indexing_jobs
-         WHERE status = 'pending' AND model_key = ?
-         ORDER BY created_at ASC
-         LIMIT 1
-       )
-       RETURNING id, doc_id, model_key, collection`,
-    )
-    .get(modelKey);
-
-  if (!row) return null;
-  return { id: row.id, docId: row.doc_id, modelKey: row.model_key, collection: row.collection };
+export interface ClaimOptions {
+  workerId: string;
+  now?: number;
+  leaseMs?: number;
+  maxAttempts?: number;
 }
 
-export function markJobDone(db: Database, id: string): void {
-  db.prepare(
-    `UPDATE indexing_jobs
-     SET status = 'done', finished_at = (strftime('%s','now')*1000), error = NULL
-     WHERE id = ?`,
-  ).run(id);
-}
-
-export function markJobError(db: Database, id: string, error: string): void {
-  // Preserve the row, set status, store the error string. Attempts already
-  // incremented at claim time — caller decides retry policy.
-  db.prepare(
-    `UPDATE indexing_jobs
-     SET status = 'error', finished_at = (strftime('%s','now')*1000), error = ?
-     WHERE id = ?`,
-  ).run(error, id);
-}
-
-/** Reset a stuck `claimed` job back to `pending` — for daemon-crash recovery. */
-export function reclaimStaleJob(db: Database, id: string): void {
-  db.prepare(
-    `UPDATE indexing_jobs
-     SET status = 'pending', claimed_at = NULL
-     WHERE id = ? AND status = 'claimed'`,
-  ).run(id);
+export function claimNextJob(
+  db: Database,
+  modelKey: string,
+  opts: ClaimOptions,
+): EnqueuedJob | null {
+  const now = opts.now ?? Date.now();
+  const leaseUntil = now + (opts.leaseMs ?? DEFAULT_LEASE_MS);
+  const maxAttempts = opts.maxAttempts ?? MAX_JOB_ATTEMPTS;
+  const token = crypto.randomUUID();
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const expired = db.query<{
+      id: string; claim_token: string; attempts: number;
+    }, [string, number]>(`
+      SELECT id, claim_token, attempts FROM indexing_jobs_v2
+      WHERE model_key = ? AND status = 'claimed' AND lease_until <= ?
+      ORDER BY lease_until, id
+    `).all(modelKey, now);
+    for (const stale of expired) {
+      const exhausted = stale.attempts >= maxAttempts;
+      db.prepare(`
+        UPDATE indexing_jobs_v2
+        SET status = ?, claim_token = NULL, claimed_by = NULL, lease_until = NULL,
+            heartbeat_at = NULL, next_attempt_at = ?, finished_at = ?, error = 'lease expired'
+        WHERE id = ? AND status = 'claimed' AND claim_token = ? AND lease_until <= ?
+      `).run(
+        exhausted ? 'exhausted' : 'retry_wait', now, exhausted ? now : null,
+        stale.id, stale.claim_token, now,
+      );
+      db.prepare(`
+        UPDATE indexing_job_attempts_v2
+        SET finished_at = ?, outcome = ?, error = 'lease expired'
+        WHERE job_id = ? AND claim_token = ? AND finished_at IS NULL
+      `).run(now, exhausted ? 'exhausted' : 'lease_expired', stale.id, stale.claim_token);
+    }
+    const row = db.query<{
+      id: string; doc_id: string; model_key: string; collection: string;
+      content_hash: string; index_revision: string; attempts: number;
+    }, [string, string, number, number, number, string, number, number]>(`
+      UPDATE indexing_jobs_v2
+      SET status = 'claimed', attempts = attempts + 1, claim_token = ?,
+          claimed_by = ?, claimed_at = ?, lease_until = ?, heartbeat_at = ?,
+          finished_at = NULL, error = NULL, external_write_started_at = NULL,
+          cancellation_too_late_at = NULL, cancellation_requested_at = NULL
+      WHERE id = (
+        SELECT id FROM indexing_jobs_v2
+        WHERE model_key = ? AND status IN ('pending','retry_wait')
+          AND next_attempt_at <= ? AND attempts < ?
+        ORDER BY next_attempt_at, created_at, id LIMIT 1
+      )
+      RETURNING id, doc_id, model_key, collection, content_hash, index_revision, attempts
+    `).get(token, opts.workerId, now, leaseUntil, now, modelKey, now, maxAttempts);
+    if (!row) {
+      db.exec('COMMIT');
+      return null;
+    }
+    db.prepare(`
+      INSERT INTO indexing_job_attempts_v2
+        (job_id, attempt_no, claim_token, worker_id, started_at, outcome)
+      VALUES (?, (SELECT COALESCE(MAX(attempt_no), 0) + 1
+                  FROM indexing_job_attempts_v2 WHERE job_id = ?), ?, ?, ?, 'claimed')
+    `).run(row.id, row.id, token, opts.workerId, now);
+    db.exec('COMMIT');
+    return {
+      id: row.id, docId: row.doc_id, modelKey: row.model_key,
+      collection: row.collection, contentHash: row.content_hash,
+      indexRevision: row.index_revision, status: 'claimed', attempts: row.attempts,
+      claimToken: token, leaseUntil,
+    };
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
 }
 
 export function jobsByStatus(
@@ -137,20 +175,13 @@ export function jobsByStatus(
   modelKey?: string,
 ): Array<{ status: string; model_key: string; count: number }> {
   if (modelKey) {
-    return db
-      .query<{ status: string; model_key: string; count: number }, [string]>(
-        `SELECT status, model_key, COUNT(*) as count FROM indexing_jobs
-         WHERE model_key = ?
-         GROUP BY status, model_key
-         ORDER BY status`,
-      )
-      .all(modelKey);
+    return db.query<{ status: string; model_key: string; count: number }, [string]>(`
+      SELECT status, model_key, COUNT(*) AS count FROM indexing_jobs_v2
+      WHERE model_key = ? GROUP BY status, model_key ORDER BY model_key, status
+    `).all(modelKey);
   }
-  return db
-    .query<{ status: string; model_key: string; count: number }, []>(
-      `SELECT status, model_key, COUNT(*) as count FROM indexing_jobs
-       GROUP BY status, model_key
-       ORDER BY model_key, status`,
-    )
-    .all();
+  return db.query<{ status: string; model_key: string; count: number }, []>(`
+    SELECT status, model_key, COUNT(*) AS count FROM indexing_jobs_v2
+    GROUP BY status, model_key ORDER BY model_key, status
+  `).all();
 }

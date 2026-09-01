@@ -73,6 +73,7 @@ export function initSupersedeLog(sqliteDb: Database): void {
 function initializeDatabase(sqliteDb: Database, drizzleDb: BunSQLiteDatabase<typeof schema>): void {
   // WAL mode for concurrent reads
   sqliteDb.exec('PRAGMA journal_mode = WAL');
+  sqliteDb.exec('PRAGMA foreign_keys = ON');
   sqliteDb.exec('PRAGMA busy_timeout = 5000');
 
   // Run Drizzle migrations (creates/updates all schema tables)

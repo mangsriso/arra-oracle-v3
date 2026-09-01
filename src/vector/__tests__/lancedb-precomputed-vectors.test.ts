@@ -116,4 +116,14 @@ describe('LanceDB addDocuments — precomputed vectors', () => {
     const res = await adapter.query('roundtrip', 5);
     expect(res.ids).toContain('doc-rt');
   });
+
+  it('rejects an existing collection with a different vector dimension', async () => {
+    const mismatch = new LanceDBAdapter('precomputed_test', tmpDir, {
+      name: 'wrong', dimensions: 3, supportsAbort: true,
+      embed: async () => [[1, 2, 3]],
+    });
+    await mismatch.connect();
+    await expect(mismatch.ensureCollection(3)).rejects.toThrow('dimension mismatch');
+    await mismatch.close();
+  });
 });

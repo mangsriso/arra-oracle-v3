@@ -4,6 +4,7 @@
 
 import { describe, it, expect } from 'bun:test';
 import { normalizeProject, extractProjectFromSource } from '../learn.ts';
+import { resolveLearnProject } from '../../learn/project.ts';
 
 // ============================================================================
 // normalizeProject
@@ -43,6 +44,18 @@ describe('normalizeProject', () => {
     expect(normalizeProject('just-a-name')).toBeNull();
     expect(normalizeProject('too/many/slashes/here')).toBeNull();
   });
+
+  it('rejects traversal and unsafe owner/repo segments', () => {
+    for (const value of ['../..', 'github.com/../..', 'owner/%2e%2e', 'owner/re po']) {
+      expect(() => normalizeProject(value)).toThrow(/unsafe/);
+    }
+  });
+
+  it('resolves shorthand and source-derived projects identically', () => {
+    expect(resolveLearnProject({ project: 'Owner/Repo' })).toBe('github.com/owner/repo');
+    expect(resolveLearnProject({ source: 'from github.com/Owner/Repo' }))
+      .toBe('github.com/owner/repo');
+  });
 });
 
 // ============================================================================
@@ -68,6 +81,12 @@ describe('extractProjectFromSource', () => {
   it('should extract direct github.com reference', () => {
     expect(extractProjectFromSource('some text github.com/foo/bar more text'))
       .toBe('github.com/foo/bar');
+  });
+
+  it('trims trailing prose punctuation without weakening segment safety', () => {
+    expect(extractProjectFromSource('see github.com/Owner/Repo).'))
+      .toBe('github.com/owner/repo');
+    expect(() => extractProjectFromSource('see github.com/../..).')).toThrow(/unsafe/);
   });
 
   it('should return null when no project found', () => {

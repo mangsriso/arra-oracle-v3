@@ -7,7 +7,7 @@
 
 import { sql } from 'drizzle-orm';
 import { sqliteTable, text, integer, index, type AnySQLiteColumn } from 'drizzle-orm/sqlite-core';
-
+export { learnReservationsV2, indexingJobsV2, indexingJobAttemptsV2, indexingJobEventsV2 } from './schema-a2.ts';
 // Main document index table
 export const oracleDocuments = sqliteTable('oracle_documents', {
   id: text('id').primaryKey(),

@@ -1,128 +1,225 @@
-/**
- * Indexer worker loop — M2 of the indexer-CLI design.
- *
- * One worker per registered model. Pulls pending jobs from `indexing_jobs`,
- * embeds via the supplied `embed()` function, writes to LanceDB via
- * `upsertVector()`, and marks the job done. On error, calls `markJobError`
- * (the row is preserved with the error message — caller decides retry policy).
- *
- * The worker is dependency-injected — no global state, no direct imports of
- * Ollama or LanceDB in this file. That keeps it unit-testable with mocks
- * and lets M3 (HTTP daemon) and M4 (CLI) wire the real adapters.
- *
- * Plug-and-play invariant honored: the worker only operates on its own
- * `model_key` queue; cross-model state (other collections, other doc rows)
- * is never touched.
- *
- * Design: ψ/lab/indexer-cli/DESIGN.md (M2).
- */
-
 import type Database from 'bun:sqlite';
 import {
-  claimNextJob,
-  markJobDone,
-  markJobError,
-  type EnqueuedJob,
+  claimNextJob, DEFAULT_LEASE_MS, type EnqueuedJob,
 } from './jobs.ts';
+import {
+  beginExternalWrite, cancellationRequested, finishClaim, hasValidClaim,
+  lateCancellationDetail, renewClaim, retryClaim,
+  type TerminalJobStatus,
+} from './job-transitions.ts';
+import { isPermanentProviderError } from '../vector/provider-error.ts';
+
+export type DocumentLoadResult =
+  | { kind: 'ready'; text: string; metadata: Record<string, string | number> }
+  | { kind: 'missing' }
+  | { kind: 'content_mismatch' }
+  | { kind: 'fts_mismatch' };
 
 export interface WorkerDeps {
   db: Database;
-  /**
-   * Resolve the document text from oracle.db. Returns null if the doc was
-   * deleted between enqueue and claim — the worker will mark the job done
-   * (no-op embed) per design (FTS-first/vector-later survives doc deletion).
-   */
-  getDocText: (docId: string) => string | null;
-  /** Embed text for `modelKey`. Throws on Ollama errors → marks job error. */
-  embed: (modelKey: string, text: string) => Promise<number[]>;
-  /** Upsert into the model's LanceDB collection. Throws → marks job error. */
-  upsertVector: (collection: string, docId: string, vector: number[]) => Promise<void>;
-  /** Returns true when the worker should exit cleanly. Caller wires SIGTERM/SIGINT. */
+  workerId: string;
+  loadDocument: (job: EnqueuedJob) => Promise<DocumentLoadResult>;
+  embed: (modelKey: string, text: string, signal: AbortSignal) => Promise<number[]>;
+  upsertVector: (input: {
+    collection: string;
+    id: string;
+    text: string;
+    metadata: Record<string, string | number>;
+    vector: number[];
+  }) => Promise<void>;
+  expectedDimension: (modelKey: string) => number;
   isShuttingDown: () => boolean;
-  /** Sleep between empty-queue polls (default 1000ms). */
+  shutdownSignal?: AbortSignal;
   pollIntervalMs?: number;
-  /** Optional event hook — called on every state change. Used by M3 SSE. */
-  onEvent?: (ev: WorkerEvent) => void;
+  attemptTimeoutMs?: number;
+  leaseMs?: number;
+  heartbeatMs?: number;
+  now?: () => number;
+  onEvent?: (event: WorkerEvent) => void;
+  onUnsafeTimeout?: (job: EnqueuedJob, phase: string) => void;
 }
 
 export type WorkerEvent =
   | { type: 'claimed'; job: EnqueuedJob }
   | { type: 'done'; job: EnqueuedJob; durationMs: number }
-  | { type: 'error'; job: EnqueuedJob; error: string }
-  | { type: 'doc_missing'; job: EnqueuedJob }
+  | { type: 'retry'; job: EnqueuedJob; error: string }
+  | { type: 'terminal'; job: EnqueuedJob; status: TerminalJobStatus; error?: string }
+  | { type: 'stale'; job: EnqueuedJob }
   | { type: 'idle'; modelKey: string };
 
 export interface WorkerStats {
   modelKey: string;
-  processed: number;     // markJobDone count (incl. doc_missing no-ops)
+  processed: number;
   errors: number;
   emptyPolls: number;
+  staleClaims: number;
 }
 
-const DEFAULT_POLL_MS = 1000;
+export class PermanentIndexError extends Error {}
+
+const DOCUMENT_TERMINAL: Record<Exclude<DocumentLoadResult['kind'], 'ready'>, TerminalJobStatus> = {
+  missing: 'skipped_missing',
+  content_mismatch: 'superseded',
+  fts_mismatch: 'blocked_projection',
+};
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return Bun.sleep(ms);
 }
 
-/**
- * Run a worker loop for a single model. Returns when `isShuttingDown()` is true.
- *
- * Caller is responsible for:
- *   - Spawning one runWorker() call per registered model (no shared state)
- *   - Plumbing real Ollama (embed) + LanceDB (upsertVector) through the deps
- *   - Setting `isShuttingDown` on signal handlers
- *
- * The function is deliberately not async-iterable — keep it as a flat loop so
- * shutdown is testable with a deterministic flag flip.
- */
-export async function runWorker(
-  modelKey: string,
-  deps: WorkerDeps,
-): Promise<WorkerStats> {
-  const stats: WorkerStats = { modelKey, processed: 0, errors: 0, emptyPolls: 0 };
-  const pollMs = deps.pollIntervalMs ?? DEFAULT_POLL_MS;
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export async function runWorker(modelKey: string, deps: WorkerDeps): Promise<WorkerStats> {
+  const stats: WorkerStats = {
+    modelKey, processed: 0, errors: 0, emptyPolls: 0, staleClaims: 0,
+  };
+  const now = deps.now ?? Date.now;
+  const leaseMs = deps.leaseMs ?? DEFAULT_LEASE_MS;
+  const heartbeatMs = deps.heartbeatMs ?? 15_000;
+  const timeoutMs = deps.attemptTimeoutMs ?? 60_000;
+  if (!Number.isFinite(heartbeatMs) || heartbeatMs <= 0 || heartbeatMs >= leaseMs) {
+    throw new Error('Heartbeat interval must be positive and shorter than lease');
+  }
+  if (timeoutMs >= leaseMs) throw new Error('Attempt timeout must be shorter than lease');
 
   while (!deps.isShuttingDown()) {
-    const job = claimNextJob(deps.db, modelKey);
+    const job = claimNextJob(deps.db, modelKey, {
+      workerId: deps.workerId, now: now(), leaseMs,
+    });
     if (!job) {
       stats.emptyPolls++;
       deps.onEvent?.({ type: 'idle', modelKey });
-      await sleep(pollMs);
+      await sleep(deps.pollIntervalMs ?? 1_000);
       continue;
     }
-
     deps.onEvent?.({ type: 'claimed', job });
-
+    const started = performance.now();
+    const token = job.claimToken!;
+    const controller = new AbortController();
+    const abortForShutdown = () => controller.abort(new Error('Worker is shutting down'));
+    deps.shutdownSignal?.addEventListener('abort', abortForShutdown, { once: true });
+    let lostFence = false;
+    let phase = 'source-load';
+    const timeout = setTimeout(() => {
+      controller.abort(new Error(`Indexer attempt timed out during ${phase}`));
+      deps.onUnsafeTimeout?.(job, phase);
+    }, timeoutMs);
+    const heartbeat = setInterval(() => {
+      try {
+        if (deps.isShuttingDown()) controller.abort(new Error('Worker is shutting down'));
+        const renewed = renewClaim(deps.db, job.id, token, now(), leaseMs);
+        if (!renewed) {
+          lostFence = true;
+          controller.abort(new Error('Claim fence was lost'));
+        }
+        if (cancellationRequested(deps.db, job.id, token)) {
+          controller.abort(new Error('Job cancellation requested'));
+        }
+      } catch (error) {
+        lostFence = true;
+        controller.abort(error);
+        deps.onUnsafeTimeout?.(job, 'heartbeat-database');
+      }
+    }, heartbeatMs);
     try {
-      const text = deps.getDocText(job.docId);
-      if (text === null) {
-        // Doc was deleted between enqueue and claim — mark done (no-op).
-        // Plug-play: removing a doc from oracle_documents leaves queue rows
-        // safely consumable. The worker absorbs the no-op gracefully.
-        markJobDone(deps.db, job.id);
-        deps.onEvent?.({ type: 'doc_missing', job });
-        stats.processed++;
+      const document = await deps.loadDocument(job);
+      if (document.kind !== 'ready') {
+        const status = DOCUMENT_TERMINAL[document.kind];
+        if (finishClaim(deps.db, job.id, token, status, document.kind, now())) {
+          stats.errors++;
+          deps.onEvent?.({ type: 'terminal', job, status, error: document.kind });
+        } else {
+          stale(stats, deps, job);
+        }
         continue;
       }
-
-      const t0 = performance.now();
-      const vector = await deps.embed(job.modelKey, text);
-      await deps.upsertVector(job.collection, job.docId, vector);
-      markJobDone(deps.db, job.id);
+      if (cancellationRequested(deps.db, job.id, token)) {
+        finishClaim(deps.db, job.id, token, 'cancelled', 'cancelled before embedding', now());
+        continue;
+      }
+      phase = 'embedding';
+      const vector = await deps.embed(job.modelKey, document.text, controller.signal);
+      if (controller.signal.aborted || lostFence) throw controller.signal.reason;
+      const dimension = deps.expectedDimension(job.modelKey);
+      if (vector.length !== dimension) {
+        throw new PermanentIndexError(
+          `Embedding dimension mismatch: expected ${dimension}, received ${vector.length}`,
+        );
+      }
+      if (!vector.every(Number.isFinite)) {
+        throw new PermanentIndexError('Embedding vector contains a non-finite value');
+      }
+      if (!hasValidClaim(deps.db, job.id, token, now())) {
+        stale(stats, deps, job);
+        continue;
+      }
+      phase = 'vector-upsert';
+      if (!beginExternalWrite(deps.db, job.id, token, now())) {
+        if (cancellationRequested(deps.db, job.id, token)) {
+          finishClaim(deps.db, job.id, token, 'cancelled', 'cancelled before vector write', now());
+        } else {
+          stale(stats, deps, job);
+        }
+        continue;
+      }
+      await deps.upsertVector({
+        collection: job.collection,
+        id: job.docId,
+        text: document.text,
+        metadata: document.metadata,
+        vector,
+      });
+      phase = 'vector-committed';
+      if (!hasValidClaim(deps.db, job.id, token, now())) {
+        stale(stats, deps, job);
+        continue;
+      }
+      const audit = lateCancellationDetail(deps.db, job.id, token);
+      if (!finishClaim(deps.db, job.id, token, 'done', audit, now())) {
+        stale(stats, deps, job);
+        continue;
+      }
       stats.processed++;
       deps.onEvent?.({
-        type: 'done',
-        job,
-        durationMs: Math.round(performance.now() - t0),
+        type: 'done', job,
+        durationMs: Math.round(performance.now() - started),
       });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      markJobError(deps.db, job.id, msg);
-      stats.errors++;
-      deps.onEvent?.({ type: 'error', job, error: msg });
+    } catch (error) {
+      const detail = message(error);
+      if (cancellationRequested(deps.db, job.id, token)) {
+        if (finishClaim(deps.db, job.id, token, 'cancelled', detail, now())) {
+          stats.errors++;
+          deps.onEvent?.({ type: 'terminal', job, status: 'cancelled', error: detail });
+        } else stale(stats, deps, job);
+      } else if (error instanceof PermanentIndexError || isPermanentProviderError(error)) {
+        if (finishClaim(deps.db, job.id, token, 'failed_permanent', detail, now())) {
+          stats.errors++;
+          deps.onEvent?.({ type: 'terminal', job, status: 'failed_permanent', error: detail });
+        } else {
+          stale(stats, deps, job);
+        }
+      } else {
+        const status = retryClaim(deps.db, job.id, token, detail, now());
+        if (status === 'stale') {
+          stale(stats, deps, job);
+        } else {
+          stats.errors++;
+          if (status === 'retry_wait') deps.onEvent?.({ type: 'retry', job, error: detail });
+          else deps.onEvent?.({ type: 'terminal', job, status: 'exhausted', error: detail });
+        }
+      }
+    } finally {
+      clearTimeout(timeout);
+      clearInterval(heartbeat);
+      deps.shutdownSignal?.removeEventListener('abort', abortForShutdown);
     }
   }
-
   return stats;
+}
+
+function stale(stats: WorkerStats, deps: WorkerDeps, job: EnqueuedJob): void {
+  stats.staleClaims++;
+  deps.onEvent?.({ type: 'stale', job });
 }

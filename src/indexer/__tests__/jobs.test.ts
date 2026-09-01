@@ -1,227 +1,196 @@
-/**
- * M1 indexer-CLI tests — table + helpers, no daemon yet.
- * Uses an in-memory SQLite for hermetic tests.
- */
-
-import { describe, it, expect, beforeEach } from 'bun:test';
-import Database from 'bun:sqlite';
+import { describe, expect, it } from 'bun:test';
 import {
-  enqueueIndexJob,
-  claimNextJob,
-  markJobDone,
-  markJobError,
-  reclaimStaleJob,
-  jobsByStatus,
+  claimNextJob, enqueueIndexJob, jobsByStatus,
 } from '../jobs.ts';
+import {
+  cancelJob, finishClaim, hasValidClaim, renewClaim, requeueTerminalJob, retryClaim,
+} from '../job-transitions.ts';
+import { queueDb, TEST_MODELS } from './v2-fixture.ts';
 
-const MIGRATION_SQL = `
-CREATE TABLE indexing_jobs (
-  id TEXT PRIMARY KEY,
-  doc_id TEXT NOT NULL,
-  model_key TEXT NOT NULL,
-  collection TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  attempts INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
-  claimed_at INTEGER,
-  finished_at INTEGER,
-  error TEXT
-);
-CREATE INDEX idx_indexing_jobs_pending ON indexing_jobs(status, model_key, created_at)
-  WHERE status IN ('pending','claimed');
-`;
+const HASH = 'a'.repeat(64);
 
-const MODELS = {
-  'bge-m3': { collection: 'oracle_knowledge_bge_m3' },
-  qwen3: { collection: 'oracle_knowledge_qwen3' },
-  nomic: { collection: 'oracle_knowledge' },
-};
-
-function freshDb(): Database {
-  const db = new Database(':memory:');
-  db.exec(MIGRATION_SQL);
-  return db;
+function enqueue(db = queueDb(), docId = 'doc-1') {
+  return {
+    db,
+    job: enqueueIndexJob(db, {
+      docId, contentHash: HASH, modelKey: 'test', models: TEST_MODELS, now: 1_000,
+    })[0],
+  };
 }
 
-describe('enqueueIndexJob', () => {
-  let db: Database;
-  beforeEach(() => { db = freshDb(); });
-
-  it('enqueues one row per registered model when modelKey omitted', () => {
-    const jobs = enqueueIndexJob(db, { docId: 'doc-1', models: MODELS });
-    expect(jobs).toHaveLength(3);
-    expect(jobs.map((j) => j.modelKey).sort()).toEqual(['bge-m3', 'nomic', 'qwen3']);
-    expect(jobs.every((j) => j.docId === 'doc-1')).toBe(true);
-    expect(jobs.find((j) => j.modelKey === 'bge-m3')!.collection).toBe('oracle_knowledge_bge_m3');
+describe('v2 enqueue', () => {
+  it('requires explicit single-model or all-model operation', () => {
+    const db = queueDb();
+    expect(() => enqueueIndexJob(db, {
+      docId: 'doc', contentHash: HASH, models: TEST_MODELS,
+    })).toThrow('Specify exactly one');
+    const jobs = enqueueIndexJob(db, {
+      docId: 'doc', contentHash: HASH, allModels: true, models: TEST_MODELS, now: 1,
+    });
+    expect(jobs.map((job) => job.modelKey).sort()).toEqual(['other', 'test']);
   });
 
-  it('enqueues exactly one row when modelKey specified', () => {
-    const jobs = enqueueIndexJob(db, { docId: 'doc-1', modelKey: 'bge-m3', models: MODELS });
-    expect(jobs).toHaveLength(1);
-    expect(jobs[0].modelKey).toBe('bge-m3');
+  it('fails closed for an unknown key and creates no row', () => {
+    const db = queueDb();
+    expect(() => enqueueIndexJob(db, {
+      docId: 'doc', contentHash: HASH, modelKey: 'missing', models: TEST_MODELS,
+    })).toThrow('Unknown model_key');
+    expect((db.query('SELECT COUNT(*) AS count FROM indexing_jobs_v2').get() as { count: number }).count)
+      .toBe(0);
   });
 
-  it('returns empty array for unknown modelKey (no insert)', () => {
-    const jobs = enqueueIndexJob(db, { docId: 'doc-1', modelKey: 'nonexistent', models: MODELS });
-    expect(jobs).toEqual([]);
-    const count = db.query('SELECT COUNT(*) as c FROM indexing_jobs').get() as { c: number };
-    expect(count.c).toBe(0);
-  });
-
-  it('generates unique job ids even across rapid calls for the same doc/model', () => {
-    const a = enqueueIndexJob(db, { docId: 'doc-1', modelKey: 'bge-m3', models: MODELS });
-    const b = enqueueIndexJob(db, { docId: 'doc-1', modelKey: 'bge-m3', models: MODELS });
-    expect(a[0].id).not.toBe(b[0].id);
-  });
-});
-
-describe('claimNextJob', () => {
-  let db: Database;
-  beforeEach(() => { db = freshDb(); });
-
-  it('returns null when queue empty for the model', () => {
-    expect(claimNextJob(db, 'bge-m3')).toBeNull();
-  });
-
-  it('claims the oldest pending job for a model', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    enqueueIndexJob(db, { docId: 'doc-B', modelKey: 'bge-m3', models: MODELS });
-    const first = claimNextJob(db, 'bge-m3');
-    expect(first?.docId).toBe('doc-A');
-    const second = claimNextJob(db, 'bge-m3');
-    expect(second?.docId).toBe('doc-B');
-    expect(claimNextJob(db, 'bge-m3')).toBeNull();
-  });
-
-  it('does not return jobs of other models', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'qwen3', models: MODELS });
-    const claimed = claimNextJob(db, 'bge-m3');
-    expect(claimed?.modelKey).toBe('bge-m3');
-    expect(claimNextJob(db, 'bge-m3')).toBeNull();
-    expect(claimNextJob(db, 'qwen3')?.modelKey).toBe('qwen3');
-  });
-
-  it('increments attempts on claim', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    const claimed = claimNextJob(db, 'bge-m3');
-    const row = db.query('SELECT attempts FROM indexing_jobs WHERE id = ?').get(claimed!.id) as { attempts: number };
-    expect(row.attempts).toBe(1);
-  });
-
-  it('does not re-claim already-claimed jobs', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    const first = claimNextJob(db, 'bge-m3');
-    expect(first).not.toBeNull();
-    const second = claimNextJob(db, 'bge-m3');
-    expect(second).toBeNull();  // already claimed, not re-claimed
+  it('returns the existing logical job on identical enqueue', () => {
+    const db = queueDb();
+    const first = enqueue(db).job;
+    const second = enqueue(db).job;
+    expect(second.id).toBe(first.id);
+    expect((db.query('SELECT COUNT(*) AS count FROM indexing_jobs_v2').get() as { count: number }).count)
+      .toBe(1);
   });
 });
 
-describe('markJobDone', () => {
-  let db: Database;
-  beforeEach(() => { db = freshDb(); });
+describe('v2 claims and fencing', () => {
+  it('claims due work atomically and appends an attempt', () => {
+    const { db } = enqueue();
+    const job = claimNextJob(db, 'test', { workerId: 'worker-a', now: 1_000, leaseMs: 90 });
+    expect(job?.attempts).toBe(1);
+    expect(job?.claimToken).toBeTruthy();
+    expect(claimNextJob(db, 'test', { workerId: 'worker-b', now: 1_001 })).toBeNull();
+    const attempt = db.query<{ outcome: string }, []>(
+      'SELECT outcome FROM indexing_job_attempts_v2',
+    ).get();
+    expect(attempt?.outcome).toBe('claimed');
+  });
 
-  it('sets status to done and finished_at, clears error', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    const job = claimNextJob(db, 'bge-m3')!;
-    markJobDone(db, job.id);
-    const row = db.query('SELECT status, finished_at, error FROM indexing_jobs WHERE id = ?').get(job.id) as { status: string; finished_at: number; error: string | null };
-    expect(row.status).toBe('done');
-    expect(row.finished_at).toBeGreaterThan(0);
-    expect(row.error).toBeNull();
+  it('renews only a live token and rejects stale completion', () => {
+    const { db } = enqueue();
+    const job = claimNextJob(db, 'test', { workerId: 'worker', now: 1_000, leaseMs: 100 })!;
+    expect(renewClaim(db, job.id, job.claimToken!, 1_050, 100)).toBe(true);
+    expect(hasValidClaim(db, job.id, job.claimToken!, 1_149)).toBe(true);
+    expect(finishClaim(db, job.id, 'stale-token', 'done', null, 1_060)).toBe(false);
+    expect(finishClaim(db, job.id, job.claimToken!, 'done', null, 1_060)).toBe(true);
+  });
+
+  it('reclaims an expired lease and the old token cannot finish', () => {
+    const { db } = enqueue();
+    const old = claimNextJob(db, 'test', { workerId: 'old', now: 1_000, leaseMs: 10 })!;
+    const fresh = claimNextJob(db, 'test', { workerId: 'fresh', now: 1_011, leaseMs: 90 })!;
+    expect(fresh.claimToken).not.toBe(old.claimToken);
+    expect(finishClaim(db, old.id, old.claimToken!, 'done', null, 1_012)).toBe(false);
+    expect(finishClaim(db, fresh.id, fresh.claimToken!, 'done', null, 1_012)).toBe(true);
+    expect(db.query('SELECT finished_at, outcome FROM indexing_job_attempts_v2 WHERE attempt_no = 1').get())
+      .toEqual({ finished_at: 1_011, outcome: 'lease_expired' });
+  });
+
+  it('three consecutive process deaths close every attempt and exhaust directly', () => {
+    const { db } = enqueue();
+    const first = claimNextJob(db, 'test', { workerId: 'dead-1', now: 1_000, leaseMs: 10 });
+    expect(first?.attempts).toBe(1);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const expiredAt = 1_000 + attempt * 11;
+      const next = claimNextJob(db, 'test', {
+        workerId: `dead-${attempt + 1}`, now: expiredAt, leaseMs: 10,
+      });
+      if (attempt < 3) expect(next?.attempts).toBe(attempt + 1);
+      else expect(next).toBeNull();
+    }
+    expect(db.query('SELECT status, attempts FROM indexing_jobs_v2').get())
+      .toEqual({ status: 'exhausted', attempts: 3 });
+    expect(db.query('SELECT attempt_no, finished_at, outcome FROM indexing_job_attempts_v2 ORDER BY attempt_no').all())
+      .toEqual([
+        { attempt_no: 1, finished_at: 1011, outcome: 'lease_expired' },
+        { attempt_no: 2, finished_at: 1022, outcome: 'lease_expired' },
+        { attempt_no: 3, finished_at: 1033, outcome: 'exhausted' },
+      ]);
+  });
+
+  it('reclaims only the requested model when leases expire together', () => {
+    const db = queueDb();
+    enqueueIndexJob(db, { docId: 'a', contentHash: HASH, modelKey: 'test', models: TEST_MODELS, now: 1 });
+    enqueueIndexJob(db, { docId: 'b', contentHash: HASH, modelKey: 'other', models: TEST_MODELS, now: 1 });
+    claimNextJob(db, 'test', { workerId: 'one', now: 10, leaseMs: 10 });
+    claimNextJob(db, 'other', { workerId: 'two', now: 10, leaseMs: 10 });
+    const reclaimed = claimNextJob(db, 'test', { workerId: 'three', now: 21, leaseMs: 10 });
+    expect(reclaimed?.modelKey).toBe('test');
+    expect(db.query(`SELECT status FROM indexing_jobs_v2 WHERE model_key = 'other'`).get())
+      .toEqual({ status: 'claimed' });
+  });
+
+  it('claims requested-model pending work even when another model sorts first', () => {
+    const db = queueDb();
+    enqueueIndexJob(db, { docId: 'a', contentHash: HASH, modelKey: 'other', models: TEST_MODELS, now: 1 });
+    enqueueIndexJob(db, { docId: 'z', contentHash: HASH, modelKey: 'test', models: TEST_MODELS, now: 2 });
+    const claimed = claimNextJob(db, 'test', { workerId: 'test-only', now: 10 });
+    expect(claimed?.modelKey).toBe('test');
+    expect(db.query(`SELECT status FROM indexing_jobs_v2 WHERE model_key = 'other'`).get())
+      .toEqual({ status: 'pending' });
   });
 });
 
-describe('markJobError', () => {
-  let db: Database;
-  beforeEach(() => { db = freshDb(); });
-
-  it('preserves row, sets status=error and stores message', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    const job = claimNextJob(db, 'bge-m3')!;
-    markJobError(db, job.id, 'Ollama timeout after 30s');
-    const row = db.query('SELECT status, error FROM indexing_jobs WHERE id = ?').get(job.id) as { status: string; error: string };
-    expect(row.status).toBe('error');
-    expect(row.error).toBe('Ollama timeout after 30s');
-  });
-});
-
-describe('reclaimStaleJob', () => {
-  let db: Database;
-  beforeEach(() => { db = freshDb(); });
-
-  it('flips claimed → pending so the queue can re-serve it (daemon crash recovery)', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    const job = claimNextJob(db, 'bge-m3')!;
-    reclaimStaleJob(db, job.id);
-    const row = db.query('SELECT status, claimed_at FROM indexing_jobs WHERE id = ?').get(job.id) as { status: string; claimed_at: number | null };
-    expect(row.status).toBe('pending');
-    expect(row.claimed_at).toBeNull();
+describe('v2 retry and cancellation', () => {
+  it('moves transient failures to retry_wait with bounded delay', () => {
+    const { db } = enqueue();
+    const job = claimNextJob(db, 'test', { workerId: 'worker', now: 1_000, leaseMs: 100 })!;
+    expect(retryClaim(db, job.id, job.claimToken!, 'temporary', 1_001)).toBe('retry_wait');
+    const row = db.query<{ next_attempt_at: number; error: string }, []>(`
+      SELECT next_attempt_at, error FROM indexing_jobs_v2
+    `).get()!;
+    expect(row.next_attempt_at).toBe(6_001);
+    expect(row.error).toBe('temporary');
   });
 
-  it('is a no-op for done/error jobs (safety: never resurrect terminal states)', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'bge-m3', models: MODELS });
-    const job = claimNextJob(db, 'bge-m3')!;
-    markJobDone(db, job.id);
-    reclaimStaleJob(db, job.id);
-    const row = db.query('SELECT status FROM indexing_jobs WHERE id = ?').get(job.id) as { status: string };
-    expect(row.status).toBe('done');
-  });
-});
-
-describe('jobsByStatus', () => {
-  let db: Database;
-  beforeEach(() => { db = freshDb(); });
-
-  it('counts pending/claimed/done/error by model', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', models: MODELS });
-    enqueueIndexJob(db, { docId: 'doc-B', models: MODELS });
-
-    const job = claimNextJob(db, 'bge-m3')!;
-    markJobDone(db, job.id);
-    const job2 = claimNextJob(db, 'qwen3')!;
-    markJobError(db, job2.id, 'whatever');
-
-    const all = jobsByStatus(db);
-    // Each of 3 models has 2 jobs total → some pending, one done/error
-    const bgeDone = all.find((r) => r.model_key === 'bge-m3' && r.status === 'done');
-    expect(bgeDone?.count).toBe(1);
-    const qwen3Error = all.find((r) => r.model_key === 'qwen3' && r.status === 'error');
-    expect(qwen3Error?.count).toBe(1);
-    const nomicPending = all.find((r) => r.model_key === 'nomic' && r.status === 'pending');
-    expect(nomicPending?.count).toBe(2);
+  it('exhausts on the third failed claim without deleting attempts', () => {
+    const { db } = enqueue();
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      db.exec(`UPDATE indexing_jobs_v2 SET next_attempt_at = 0`);
+      const job = claimNextJob(db, 'test', {
+        workerId: 'worker', now: attempt * 1_000, leaseMs: 500,
+      })!;
+      const outcome = retryClaim(db, job.id, job.claimToken!, 'temporary', attempt * 1_000 + 1);
+      expect(outcome).toBe(attempt === 3 ? 'exhausted' : 'retry_wait');
+    }
+    expect((db.query('SELECT COUNT(*) AS count FROM indexing_job_attempts_v2').get() as { count: number }).count)
+      .toBe(3);
   });
 
-  it('filters by modelKey when provided', () => {
-    enqueueIndexJob(db, { docId: 'doc-A', models: MODELS });
-    const rows = jobsByStatus(db, 'bge-m3');
-    expect(rows.every((r) => r.model_key === 'bge-m3')).toBe(true);
-    expect(rows[0].count).toBe(1);
+  it('cancels eligible work but never rewrites done history', () => {
+    const { db, job } = enqueue();
+    expect(cancelJob(db, job.id, 'operator')).toBe(true);
+    expect(cancelJob(db, job.id, 'again')).toBe(false);
+    expect(jobsByStatus(db)[0]).toMatchObject({ status: 'cancelled', count: 1 });
   });
-});
 
-describe('plug-and-play invariant — adding a model never disturbs other models', () => {
-  it('enqueues for newly-added model on next call without touching prior rows', () => {
-    const db = freshDb();
-    const initialModels = { 'bge-m3': { collection: 'oracle_knowledge_bge_m3' } };
-    enqueueIndexJob(db, { docId: 'doc-A', models: initialModels });
-
-    const initialCount = db.query('SELECT COUNT(*) as c FROM indexing_jobs').get() as { c: number };
-    expect(initialCount.c).toBe(1);
-
-    // Now operator adds qwen3 to vector-server.json — simulate by passing larger registry
-    const expandedModels = {
-      'bge-m3': { collection: 'oracle_knowledge_bge_m3' },
-      qwen3: { collection: 'oracle_knowledge_qwen3' },
-    };
-    enqueueIndexJob(db, { docId: 'doc-B', models: expandedModels });
-
-    // doc-B got 2 rows (one per model), doc-A still has its original 1 row, untouched
-    const finalRows = db.query('SELECT doc_id, model_key FROM indexing_jobs ORDER BY doc_id, model_key').all() as Array<{ doc_id: string; model_key: string }>;
-    expect(finalRows).toHaveLength(3);
-    expect(finalRows[0]).toEqual({ doc_id: 'doc-A', model_key: 'bge-m3' });
-    expect(finalRows[1]).toEqual({ doc_id: 'doc-B', model_key: 'bge-m3' });
-    expect(finalRows[2]).toEqual({ doc_id: 'doc-B', model_key: 'qwen3' });
+  it('requeues terminal work with a reason and preserves attempt history', () => {
+    const { db, job } = enqueue();
+    const claim = claimNextJob(db, 'test', { workerId: 'one', now: 1_001, leaseMs: 100 })!;
+    finishClaim(db, job.id, claim.claimToken!, 'failed_permanent', 'bad', 1_002);
+    expect(requeueTerminalJob(db, job.id, 'operator corrected provider', 1_003)).toBe(true);
+    expect(db.query('SELECT status, attempts, error FROM indexing_jobs_v2').get()).toEqual({
+      status: 'pending', attempts: 0, error: 'operator requeue: operator corrected provider',
+    });
+    const next = claimNextJob(db, 'test', { workerId: 'two', now: 1_004, leaseMs: 100 })!;
+    expect(next.attempts).toBe(1);
+    expect(db.query('SELECT attempt_no FROM indexing_job_attempts_v2 ORDER BY attempt_no').all())
+      .toEqual([{ attempt_no: 1 }, { attempt_no: 2 }]);
+    expect(db.query(`SELECT event_type, reason FROM indexing_job_events_v2`).get())
+      .toEqual({ event_type: 'operator_requeue', reason: 'operator corrected provider' });
+    expect(db.query(`SELECT error FROM indexing_jobs_v2`).get()).toEqual({ error: null });
   });
+
+  for (const status of ['pending', 'claimed', 'retry_wait', 'done'] as const) {
+    it(`requeue is a no-op for ${status} with history unchanged`, () => {
+      const { db, job } = enqueue();
+      if (status !== 'pending') {
+        const claimed = claimNextJob(db, 'test', { workerId: 'one', now: 1_001, leaseMs: 100 })!;
+        if (status === 'retry_wait') retryClaim(db, job.id, claimed.claimToken!, 'later', 1_002);
+        if (status === 'done') finishClaim(db, job.id, claimed.claimToken!, 'done', null, 1_002);
+      }
+      const before = db.query(`SELECT * FROM indexing_jobs_v2 WHERE id = ?`).get(job.id);
+      const attempts = db.query(`SELECT * FROM indexing_job_attempts_v2 ORDER BY id`).all();
+      expect(requeueTerminalJob(db, job.id, 'must not append', 1_003)).toBe(false);
+      expect(db.query(`SELECT * FROM indexing_jobs_v2 WHERE id = ?`).get(job.id)).toEqual(before);
+      expect(db.query(`SELECT * FROM indexing_job_attempts_v2 ORDER BY id`).all()).toEqual(attempts);
+      expect(db.query(`SELECT COUNT(*) AS n FROM indexing_job_events_v2`).get()).toEqual({ n: 0 });
+    });
+  }
 });
