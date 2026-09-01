@@ -57,7 +57,9 @@ git('add', '-A');
 git('commit', '-q', '-m', 'test fixture');
 fs.writeFileSync(path.join(vaultPath, 'unrelated.txt'), 'unstaged user change\n');
 
+const realDb = await import('../../db/index.ts');
 mock.module(path.resolve(import.meta.dir, '../../db/index.ts'), () => ({
+  ...realDb,
   getSetting: (key: string) => key === 'vault_repo' ? 'test-owner/test-vault' : null,
   setSetting: () => {},
 }));

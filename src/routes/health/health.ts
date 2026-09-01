@@ -5,6 +5,8 @@ import { resolveVaultPath } from '../../vault/discovery.ts';
 import { getSetting } from '../../db/index.ts';
 import { resolveVaultHealth } from './vault-health.ts';
 import pkg from '../../../package.json' with { type: 'json' };
+import { getEmbeddingModels } from '../../vector/factory.ts';
+import { resolveAsyncIndexerConfig } from '../../vector/indexer-config.ts';
 
 /**
  * Vault resolution state, surfaced so a watchdog can see it.
@@ -24,6 +26,26 @@ export const healthEndpoint = new Elysia().get('/health', () => {
     getRepo: () => getSetting('vault_repo'),
     resolveRepo: resolveVaultPath,
   });
+  let indexing;
+  try {
+    const config = resolveAsyncIndexerConfig(getEmbeddingModels());
+    indexing = {
+      ready: true,
+      producer_enabled: config.producerEnabled,
+      workers_enabled: config.workersEnabled,
+      active_model_key: config.modelKey,
+      index_revision: config.indexRevision,
+      dimension: config.dimension,
+      collection: config.collection,
+    };
+  } catch (error) {
+    indexing = {
+      ready: false,
+      producer_enabled: process.env.ORACLE_INDEXER_ENQUEUE === '1',
+      workers_enabled: process.env.ORACLE_INDEXER_WORKERS_ENABLED === '1',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
   return {
     status: 'ok',
     server: MCP_SERVER_NAME,
@@ -32,6 +54,7 @@ export const healthEndpoint = new Elysia().get('/health', () => {
     oracle: 'connected',
     repoRoot: REPO_ROOT,
     vault,
+    indexing,
   };
 }, {
   detail: {

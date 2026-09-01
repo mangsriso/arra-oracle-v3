@@ -12,18 +12,17 @@
  */
 
 import type { VectorStoreAdapter, VectorDocument, VectorQueryResult, EmbeddingProvider, EmbedType } from '../types.ts';
+import { EmbeddingProviderHttpError } from '../provider-error.ts';
 
 const CF_MODEL = '@cf/baai/bge-m3';
 const CF_DIMENSIONS = 1024;
 const BATCH_SIZE = 20; // Thai text uses 2-3x tokens, keep under 60K limit
 
-/**
- * Cloudflare Workers AI Embedding Provider
- * Works via REST API from any runtime.
- */
+/** Cloudflare Workers AI embedding provider. */
 export class CloudflareAIEmbeddings implements EmbeddingProvider {
   readonly name = 'cloudflare-ai';
   readonly dimensions = CF_DIMENSIONS;
+  readonly supportsAbort = true;
   private accountId: string;
   private apiToken: string;
   private model: string;
@@ -38,7 +37,7 @@ export class CloudflareAIEmbeddings implements EmbeddingProvider {
     }
   }
 
-  async embed(texts: string[], _type?: EmbedType): Promise<number[][]> {
+  async embed(texts: string[], _type?: EmbedType, signal?: AbortSignal): Promise<number[][]> {
     if (!texts.length) return [];
 
     const allEmbeddings: number[][] = [];
@@ -58,12 +57,13 @@ export class CloudflareAIEmbeddings implements EmbeddingProvider {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ text: truncated }),
+          signal,
         }
       );
 
       if (!response.ok) {
         const error = await response.text();
-        throw new Error(`Cloudflare AI error: ${error}`);
+        throw new EmbeddingProviderHttpError(response.status, `Cloudflare AI error: ${error}`);
       }
 
       const data = await response.json() as {

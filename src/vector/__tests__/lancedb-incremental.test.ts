@@ -114,6 +114,9 @@ describe('LanceDB incremental adapter methods', () => {
     const adapter = new LanceDBAdapter('test', '/unused', new MockEmbedder());
     let refreshed = 0;
     const table = {
+      async schema() {
+        return { fields: [{ name: 'vector', type: { listSize: 2 } }] };
+      },
       async checkoutLatest() {
         refreshed++;
       },

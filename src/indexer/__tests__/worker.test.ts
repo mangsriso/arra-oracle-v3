@@ -1,265 +1,244 @@
-/**
- * M2 indexer worker tests — happy path, error paths, shutdown, doc-missing.
- *
- * Hermetic: in-memory SQLite, mock embed/upsertVector/getDocText, no Ollama,
- * no LanceDB. Uses fake timers via short pollIntervalMs so the loop turns over
- * fast.
- */
-
-import { describe, it, expect, beforeEach } from 'bun:test';
-import Database from 'bun:sqlite';
+import { describe, expect, it } from 'bun:test';
 import { enqueueIndexJob } from '../jobs.ts';
-import { runWorker, type WorkerDeps, type WorkerEvent } from '../worker.ts';
+import { claimNextJob } from '../jobs.ts';
+import { cancelJob } from '../job-transitions.ts';
+import { PermanentIndexError, runWorker, type WorkerDeps } from '../worker.ts';
+import { EmbeddingProviderHttpError } from '../../vector/provider-error.ts';
+import { queueDb, TEST_MODELS } from './v2-fixture.ts';
 
-const MIGRATION_SQL = `
-CREATE TABLE indexing_jobs (
-  id TEXT PRIMARY KEY,
-  doc_id TEXT NOT NULL,
-  model_key TEXT NOT NULL,
-  collection TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  attempts INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
-  claimed_at INTEGER,
-  finished_at INTEGER,
-  error TEXT
-);
-`;
+const HASH = 'b'.repeat(64);
 
-const MODELS = {
-  'bge-m3': { collection: 'oracle_knowledge_bge_m3' },
-};
-
-function freshDb(): Database {
-  const db = new Database(':memory:');
-  db.exec(MIGRATION_SQL);
+function setup() {
+  const db = queueDb();
+  enqueueIndexJob(db, {
+    docId: 'doc-1', contentHash: HASH, modelKey: 'test', models: TEST_MODELS, now: 1_000,
+  });
   return db;
 }
 
-interface TestHarness {
-  db: Database;
-  embedded: Array<{ model: string; text: string }>;
-  upserted: Array<{ collection: string; docId: string; vectorLen: number }>;
-  events: WorkerEvent[];
-  shutdownAfter: number;  // signal shutdown after this many job iterations
-}
-
-function makeDeps(harness: TestHarness, overrides: Partial<WorkerDeps> = {}): WorkerDeps {
-  const docTexts: Record<string, string | null> = {
-    'doc-A': 'air quality monitoring with PM2.5 sensors',
-    'doc-B': 'flood radar accuracy on JIBCHAIN L1 blockchain',
-    'doc-deleted': null,
-  };
-  let iterations = 0;
+function deps(db: ReturnType<typeof queueDb>, overrides: Partial<WorkerDeps> = {}): WorkerDeps {
+  let checks = 0;
   return {
-    db: harness.db,
-    getDocText: (id) => (id in docTexts ? docTexts[id] : `synthetic content for ${id}`),
-    embed: async (model, text) => {
-      harness.embedded.push({ model, text });
-      return new Array(1024).fill(0).map(() => Math.random());
-    },
-    upsertVector: async (collection, docId, vector) => {
-      harness.upserted.push({ collection, docId, vectorLen: vector.length });
-    },
-    isShuttingDown: () => {
-      iterations++;
-      return iterations > harness.shutdownAfter;
-    },
-    pollIntervalMs: 5,  // fast empty-queue polls in tests
-    onEvent: (ev) => harness.events.push(ev),
+    db,
+    workerId: 'worker-test',
+    loadDocument: async () => ({
+      kind: 'ready', text: 'authoritative text', metadata: { content_hash: HASH },
+    }),
+    embed: async () => [0.1, 0.2, 0.3],
+    upsertVector: async () => {},
+    expectedDimension: () => 3,
+    isShuttingDown: () => checks++ > 0,
+    pollIntervalMs: 1,
+    attemptTimeoutMs: 50,
+    heartbeatMs: 10,
+    leaseMs: 100,
+    now: () => 1_001,
     ...overrides,
   };
 }
 
-describe('runWorker — happy path', () => {
-  it('processes one job: claim → embed → upsert → mark done', async () => {
-    const db = freshDb();
-    enqueueIndexJob(db, { docId: 'doc-A', models: MODELS });
-
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 2 };
-    const stats = await runWorker('bge-m3', makeDeps(harness));
-
-    expect(stats.processed).toBe(1);
-    expect(stats.errors).toBe(0);
-    expect(harness.embedded).toHaveLength(1);
-    expect(harness.embedded[0]).toEqual({
-      model: 'bge-m3',
-      text: 'air quality monitoring with PM2.5 sensors',
-    });
-    expect(harness.upserted).toHaveLength(1);
-    expect(harness.upserted[0]).toEqual({
-      collection: 'oracle_knowledge_bge_m3',
-      docId: 'doc-A',
-      vectorLen: 1024,
-    });
-
-    const row = db.query('SELECT status FROM indexing_jobs').get() as { status: string };
-    expect(row.status).toBe('done');
-  });
-
-  it('processes multiple jobs in FIFO order', async () => {
-    const db = freshDb();
-    enqueueIndexJob(db, { docId: 'doc-A', models: MODELS });
-    enqueueIndexJob(db, { docId: 'doc-B', models: MODELS });
-
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 3 };
-    const stats = await runWorker('bge-m3', makeDeps(harness));
-
-    expect(stats.processed).toBe(2);
-    expect(harness.upserted.map((u) => u.docId)).toEqual(['doc-A', 'doc-B']);
-  });
-
-  it('emits claimed → done events', async () => {
-    const db = freshDb();
-    enqueueIndexJob(db, { docId: 'doc-A', models: MODELS });
-
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 2 };
-    await runWorker('bge-m3', makeDeps(harness));
-
-    const types = harness.events.map((e) => e.type);
-    expect(types).toContain('claimed');
-    expect(types).toContain('done');
-    const doneEvent = harness.events.find((e) => e.type === 'done') as Extract<WorkerEvent, { type: 'done' }>;
-    expect(doneEvent.durationMs).toBeGreaterThanOrEqual(0);
-  });
-});
-
-describe('runWorker — error paths', () => {
-  it('marks job error when embed throws', async () => {
-    const db = freshDb();
-    enqueueIndexJob(db, { docId: 'doc-A', models: MODELS });
-
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 2 };
-    const deps = makeDeps(harness, {
-      embed: async () => { throw new Error('Ollama timeout'); },
-    });
-    const stats = await runWorker('bge-m3', deps);
-
-    expect(stats.processed).toBe(0);
-    expect(stats.errors).toBe(1);
-    expect(harness.upserted).toHaveLength(0);
-
-    const row = db.query('SELECT status, error FROM indexing_jobs').get() as { status: string; error: string };
-    expect(row.status).toBe('error');
-    expect(row.error).toBe('Ollama timeout');
-
-    const err = harness.events.find((e) => e.type === 'error') as Extract<WorkerEvent, { type: 'error' }>;
-    expect(err.error).toBe('Ollama timeout');
-  });
-
-  it('marks job error when upsertVector throws', async () => {
-    const db = freshDb();
-    enqueueIndexJob(db, { docId: 'doc-A', models: MODELS });
-
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 2 };
-    const deps = makeDeps(harness, {
-      upsertVector: async () => { throw new Error('LanceDB write failed'); },
-    });
-    const stats = await runWorker('bge-m3', deps);
-
-    expect(stats.errors).toBe(1);
-    expect(harness.embedded).toHaveLength(1);  // embedding succeeded before write failed
-
-    const row = db.query('SELECT status, error FROM indexing_jobs').get() as { status: string; error: string };
-    expect(row.status).toBe('error');
-    expect(row.error).toBe('LanceDB write failed');
-  });
-
-  it('continues processing after one job errors (does not poison the worker)', async () => {
-    const db = freshDb();
-    enqueueIndexJob(db, { docId: 'doc-fail', models: MODELS });
-    enqueueIndexJob(db, { docId: 'doc-A', models: MODELS });
-
-    let callCount = 0;
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 3 };
-    const deps = makeDeps(harness, {
-      embed: async (model, text) => {
-        callCount++;
-        if (callCount === 1) throw new Error('first call fails');
-        harness.embedded.push({ model, text });
-        return new Array(1024).fill(0);
+describe('fenced worker', () => {
+  it('embeds authoritative text once and upserts full plain-id document', async () => {
+    const db = setup();
+    const embedded: string[] = [];
+    const writes: unknown[] = [];
+    const stats = await runWorker('test', deps(db, {
+      embed: async (_key, text) => {
+        embedded.push(text);
+        return [0.1, 0.2, 0.3];
       },
+      upsertVector: async (input) => { writes.push(input); },
+    }));
+    expect(stats.processed).toBe(1);
+    expect(embedded).toEqual(['authoritative text']);
+    expect(writes).toEqual([{
+      collection: 'test_vectors', id: 'doc-1', text: 'authoritative text',
+      metadata: { content_hash: HASH }, vector: [0.1, 0.2, 0.3],
+    }]);
+    expect((db.query('SELECT status FROM indexing_jobs_v2').get() as { status: string }).status)
+      .toBe('done');
+  });
+
+  it('crash-after-upsert replay converges to one plain-id vector row', async () => {
+    const db = setup();
+    const vectors = new Map<string, string>();
+    await runWorker('test', deps(db, {
+      upsertVector: async (input) => {
+        vectors.set(input.id, input.text);
+        throw new Error('crash after vector commit');
+      },
+    }));
+    db.exec(`UPDATE indexing_jobs_v2 SET next_attempt_at = 0`);
+    await runWorker('test', deps(db, {
+      now: () => 7_000,
+      upsertVector: async (input) => { vectors.set(input.id, input.text); },
+    }));
+    expect([...vectors.entries()]).toEqual([['doc-1', 'authoritative text']]);
+    expect((db.query('SELECT status FROM indexing_jobs_v2').get() as { status: string }).status)
+      .toBe('done');
+  });
+
+  for (const [kind, status] of [
+    ['missing', 'skipped_missing'],
+    ['content_mismatch', 'superseded'],
+    ['fts_mismatch', 'blocked_projection'],
+  ] as const) {
+    it(`closes ${kind} as ${status} without embedding`, async () => {
+      const db = setup();
+      let embeds = 0;
+      await runWorker('test', deps(db, {
+        loadDocument: async () => ({ kind }),
+        embed: async () => { embeds++; return [1, 2, 3]; },
+      }));
+      expect(embeds).toBe(0);
+      expect((db.query('SELECT status FROM indexing_jobs_v2').get() as { status: string }).status)
+        .toBe(status);
     });
-    const stats = await runWorker('bge-m3', deps);
+  }
 
-    expect(stats.processed).toBe(1);
-    expect(stats.errors).toBe(1);
-    expect(harness.upserted).toHaveLength(1);
-    expect(harness.upserted[0].docId).toBe('doc-A');
-  });
-});
-
-describe('runWorker — doc-missing graceful handling', () => {
-  it('marks job done (no embed/upsert) when doc text is null', async () => {
-    const db = freshDb();
-    enqueueIndexJob(db, { docId: 'doc-deleted', models: MODELS });
-
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 2 };
-    const stats = await runWorker('bge-m3', makeDeps(harness));
-
-    expect(stats.processed).toBe(1);
-    expect(stats.errors).toBe(0);
-    expect(harness.embedded).toHaveLength(0);  // no embed call
-    expect(harness.upserted).toHaveLength(0);
-
-    const row = db.query('SELECT status FROM indexing_jobs').get() as { status: string };
-    expect(row.status).toBe('done');
-
-    const types = harness.events.map((e) => e.type);
-    expect(types).toContain('doc_missing');
-    expect(types).toContain('claimed');
-  });
-});
-
-describe('runWorker — shutdown', () => {
-  it('exits cleanly when isShuttingDown() returns true', async () => {
-    const db = freshDb();
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 0 };
-    const stats = await runWorker('bge-m3', makeDeps(harness));
-    expect(stats.processed).toBe(0);
-    expect(stats.emptyPolls).toBe(0);  // shutdown checked BEFORE first claim
+  it('marks dimension mismatch permanent and never calls upsert', async () => {
+    const db = setup();
+    let writes = 0;
+    await runWorker('test', deps(db, {
+      embed: async () => [1],
+      upsertVector: async () => { writes++; },
+    }));
+    expect(writes).toBe(0);
+    expect((db.query('SELECT status FROM indexing_jobs_v2').get() as { status: string }).status)
+      .toBe('failed_permanent');
   });
 
-  it('processes in-flight job to completion before exiting on next loop check', async () => {
-    const db = freshDb();
-    enqueueIndexJob(db, { docId: 'doc-A', models: MODELS });
-
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 1 };
-    const stats = await runWorker('bge-m3', makeDeps(harness));
-
-    // First iteration: shutdown check returns false → job processed
-    // Second iteration: shutdown check returns true → exit
-    expect(stats.processed).toBe(1);
-    expect(harness.upserted).toHaveLength(1);
+  it('marks non-finite vectors permanent before upsert', async () => {
+    const db = setup();
+    let writes = 0;
+    await runWorker('test', deps(db, {
+      embed: async () => [1, Number.NaN, 3],
+      upsertVector: async () => { writes++; },
+    }));
+    expect(writes).toBe(0);
+    expect((db.query('SELECT status FROM indexing_jobs_v2').get() as { status: string }).status)
+      .toBe('failed_permanent');
   });
-});
 
-describe('runWorker — empty queue', () => {
-  it('counts empty polls and emits idle events', async () => {
-    const db = freshDb();
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 3 };
-    const stats = await runWorker('bge-m3', makeDeps(harness));
-
-    expect(stats.processed).toBe(0);
-    expect(stats.emptyPolls).toBeGreaterThan(0);
-    const types = harness.events.map((e) => e.type);
-    expect(types).toContain('idle');
+  it('late provider resolution after deadline cannot upsert', async () => {
+    const db = setup();
+    let writes = 0;
+    await runWorker('test', deps(db, {
+      attemptTimeoutMs: 5,
+      embed: async (_key, _text, signal) => {
+        await Bun.sleep(15);
+        expect(signal.aborted).toBe(true);
+        return [1, 2, 3];
+      },
+      upsertVector: async () => { writes++; },
+    }));
+    expect(writes).toBe(0);
+    expect((db.query('SELECT status FROM indexing_jobs_v2').get() as { status: string }).status)
+      .toBe('retry_wait');
   });
-});
 
-describe('runWorker — model isolation (plug-play)', () => {
-  it('only processes jobs for its own model_key', async () => {
-    const db = freshDb();
-    enqueueIndexJob(db, { docId: 'doc-A', modelKey: 'bge-m3', models: { 'bge-m3': { collection: 'c1' }, qwen3: { collection: 'c2' } } });
-    enqueueIndexJob(db, { docId: 'doc-B', modelKey: 'qwen3', models: { 'bge-m3': { collection: 'c1' }, qwen3: { collection: 'c2' } } });
+  it('classifies explicit permanent provider errors without retry', async () => {
+    const db = setup();
+    await runWorker('test', deps(db, {
+      embed: async () => { throw new PermanentIndexError('invalid input'); },
+    }));
+    expect((db.query('SELECT status FROM indexing_jobs_v2').get() as { status: string }).status)
+      .toBe('failed_permanent');
+  });
 
-    const harness: TestHarness = { db, embedded: [], upserted: [], events: [], shutdownAfter: 3 };
-    const stats = await runWorker('bge-m3', makeDeps(harness));
+  for (const [status, expected] of [
+    [400, 'failed_permanent'], [422, 'failed_permanent'], [499, 'failed_permanent'],
+    [408, 'retry_wait'], [429, 'retry_wait'], [500, 'retry_wait'], [599, 'retry_wait'],
+  ] as const) {
+    it(`classifies provider HTTP ${status} as ${expected}`, async () => {
+      const db = setup();
+      await runWorker('test', deps(db, {
+        embed: async () => { throw new EmbeddingProviderHttpError(status, `provider ${status}`); },
+      }));
+      expect((db.query('SELECT status FROM indexing_jobs_v2').get() as { status: string }).status)
+        .toBe(expected);
+    });
+  }
 
-    expect(stats.processed).toBe(1);
-    expect(harness.upserted[0].docId).toBe('doc-A');
-    // qwen3 job should still be pending
-    const qwenRow = db.query('SELECT status FROM indexing_jobs WHERE model_key = ?').get('qwen3') as { status: string };
-    expect(qwenRow.status).toBe('pending');
+  it('keeps an ordinary non-HTTP provider failure retryable', async () => {
+    const db = setup();
+    await runWorker('test', deps(db, { embed: async () => { throw new Error('network reset'); } }));
+    expect(db.query('SELECT status FROM indexing_jobs_v2').get()).toEqual({ status: 'retry_wait' });
+  });
+
+  it('cancels before the external-write commit point without writing a vector', async () => {
+    const db = setup();
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let writes = 0;
+    const running = runWorker('test', deps(db, {
+      now: Date.now, leaseMs: 200, heartbeatMs: 5, attemptTimeoutMs: 100,
+      embed: async () => { entered(); await gate; return [1, 2, 3]; },
+      upsertVector: async () => { writes++; },
+    }));
+    await started;
+    const id = (db.query('SELECT id FROM indexing_jobs_v2').get() as { id: string }).id;
+    expect(cancelJob(db, id, 'before write')).toBe(true);
+    release();
+    await running;
+    expect(writes).toBe(0);
+    expect(db.query('SELECT status FROM indexing_jobs_v2').get()).toEqual({ status: 'cancelled' });
+  });
+
+  it('keeps one owner through blocked upsert and records late cancellation while committing done', async () => {
+    const db = setup();
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const vectors = new Map<string, string>();
+    const running = runWorker('test', deps(db, {
+      now: Date.now,
+      leaseMs: 200,
+      heartbeatMs: 5,
+      attemptTimeoutMs: 100,
+      upsertVector: async (input) => {
+        entered();
+        await gate;
+        vectors.set(input.id, input.text);
+      },
+    }));
+    await started;
+    const row = db.query<{ id: string; lease_until: number }, []>(
+      'SELECT id, lease_until FROM indexing_jobs_v2',
+    ).get()!;
+    expect(cancelJob(db, row.id, 'late operator cancellation')).toBe(true);
+    const deadline = Date.now() + 500;
+    let renewed = row.lease_until;
+    while (renewed <= row.lease_until && Date.now() < deadline) {
+      await Bun.sleep(2);
+      renewed = db.query<{ lease_until: number }, []>(
+        'SELECT lease_until FROM indexing_jobs_v2',
+      ).get()!.lease_until;
+    }
+    expect(renewed).toBeGreaterThan(row.lease_until);
+    expect(claimNextJob(db, 'test', { workerId: 'racer', now: Date.now(), leaseMs: 200 })).toBeNull();
+    release();
+    await running;
+    expect(vectors.get('doc-1')).toBe('authoritative text');
+    expect(db.query('SELECT status, attempts, error FROM indexing_jobs_v2').get())
+      .toEqual({
+        status: 'done', attempts: 1,
+        error: 'cancellation requested too late: late operator cancellation',
+      });
+    expect(db.query(`SELECT event_type, reason FROM indexing_job_events_v2`).get())
+      .toEqual({ event_type: 'cancellation_too_late', reason: 'late operator cancellation' });
+  });
+
+  it('rejects invalid heartbeat intervals before claiming', async () => {
+    for (const heartbeatMs of [0, 100, 101]) {
+      const db = setup();
+      await expect(runWorker('test', deps(db, { heartbeatMs, leaseMs: 100 })))
+        .rejects.toThrow('Heartbeat interval');
+      expect(db.query('SELECT status, attempts FROM indexing_jobs_v2').get())
+        .toEqual({ status: 'pending', attempts: 0 });
+    }
   });
 });

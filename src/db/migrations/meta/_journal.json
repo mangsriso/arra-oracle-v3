@@ -120,6 +120,13 @@
       "when": 1780185600000,
       "tag": "0016_indexing_jobs",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1788210000000,
+      "tag": "0017_durable_async_indexing_v2",
+      "breakpoints": true
     }
   ]
 }

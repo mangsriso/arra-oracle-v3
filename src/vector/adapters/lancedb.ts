@@ -35,14 +35,25 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     console.log('[LanceDB] Closed');
   }
 
-  async ensureCollection(): Promise<void> {
+  async ensureCollection(expectedDimension = this.embedder.dimensions): Promise<void> {
     if (!this.db) throw new Error('LanceDB not connected');
 
     const tableNames = await this.db.tableNames();
     if (tableNames.includes(this.collectionName)) {
       this.table = await this.db.openTable(this.collectionName);
+      const schema = await this.table.schema();
+      const vector = schema.fields.find((field: { name: string }) => field.name === 'vector');
+      const dimension = vector?.type?.listSize;
+      if (!Number.isInteger(dimension) || dimension !== expectedDimension) {
+        throw new Error(
+          `LanceDB collection dimension mismatch: expected ${expectedDimension}, found ${dimension ?? 'unknown'}`,
+        );
+      }
     } else {
-      const dims = this.embedder.dimensions;
+      const dims = expectedDimension;
+      if (!Number.isInteger(dims) || dims <= 0) {
+        throw new Error('A positive verified embedding dimension is required before collection creation');
+      }
       this.table = await this.db.createTable(this.collectionName, [{
         id: '__init__',
         text: '',

@@ -20,6 +20,10 @@ export interface VectorCollectionConfig {
   collection: string;
   model: string;
   provider: EmbeddingProviderType;
+  dimension: number;
+  metadataSchemaVersion: number;
+  supportsAbort: boolean;
+  supportsPrecomputedUpsert: boolean;
   primary?: boolean;
 }
 
@@ -27,6 +31,10 @@ export interface EmbeddingModelPreset {
   collection: string;
   model: string;
   provider: EmbeddingProviderType;
+  dimension: number;
+  metadataSchemaVersion: number;
+  supportsAbort: boolean;
+  supportsPrecomputedUpsert: boolean;
   dataPath?: string;
 }
 
@@ -58,17 +66,29 @@ export function generateDefaultConfig(): VectorServerConfig {
         collection: 'oracle_knowledge_bge_m3',
         model: 'bge-m3',
         provider: 'ollama',
+        dimension: 1024,
+        metadataSchemaVersion: 1,
+        supportsAbort: true,
+        supportsPrecomputedUpsert: true,
         primary: true,
       },
       nomic: {
         collection: COLLECTION_NAME,
         model: 'nomic-embed-text',
         provider: 'ollama',
+        dimension: 768,
+        metadataSchemaVersion: 1,
+        supportsAbort: true,
+        supportsPrecomputedUpsert: true,
       },
       qwen3: {
         collection: 'oracle_knowledge_qwen3',
         model: 'qwen3-embedding',
         provider: 'ollama',
+        dimension: 4096,
+        metadataSchemaVersion: 1,
+        supportsAbort: true,
+        supportsPrecomputedUpsert: true,
       },
     },
     dataPath: LANCEDB_DIR,
@@ -115,6 +135,10 @@ export function configToModels(
       collection: col.collection,
       model: col.model,
       provider: col.provider || 'ollama',
+      dimension: col.dimension,
+      metadataSchemaVersion: col.metadataSchemaVersion,
+      supportsAbort: col.supportsAbort,
+      supportsPrecomputedUpsert: col.supportsPrecomputedUpsert,
       dataPath: config.dataPath || undefined,
     };
   }

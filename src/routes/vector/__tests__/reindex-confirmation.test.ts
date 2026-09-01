@@ -39,7 +39,9 @@ mock.module(path.resolve(import.meta.dir, '../../../vector/factory.ts'), () => (
   getEmbeddingModels,
   createVectorStore,
 }));
+const realDb = await import('../../../db/index.ts');
 mock.module(path.resolve(import.meta.dir, '../../../db/index.ts'), () => ({
+  ...realDb,
   createDatabase,
 }));
 mock.module(path.resolve(import.meta.dir, '../../../indexer/status.ts'), () => ({

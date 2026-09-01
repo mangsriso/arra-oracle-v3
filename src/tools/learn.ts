@@ -1,25 +1,19 @@
-/**
- * Oracle Learn Handler
- *
- * Add new patterns/learnings to the knowledge base.
- * Exports normalizeProject and extractProjectFromSource for testability.
- */
-
-import path from 'path';
-import fs from 'fs';
-import { oracleDocuments } from '../db/schema.ts';
-import { getSetting } from '../db/index.ts';
-import { detectProject } from '../server/project-detect.ts';
-import { getVaultPsiRoot } from '../vault/handler.ts';
-import { getVectorStoreByModel, getEmbeddingModels } from '../vector/factory.ts';
-import { enqueueIndexJob } from '../indexer/jobs.ts';
-import { REPO_ROOT } from '../config.ts';
+import { getEmbeddingModels } from '../vector/factory.ts';
+import { resolveAsyncIndexerConfig } from '../vector/indexer-config.ts';
+import { LearnConflictError, persistAsyncLearning } from '../learn/persistence.ts';
+import { mcpLearnResponse } from '../learn/transport.ts';
+import {
+  extractProjectFromSource, normalizeProject, resolveLearnProject,
+} from '../learn/project.ts';
+import { resolveLearnStorage } from '../learn/storage.ts';
+import { handleLegacyLearn } from './learn-legacy.ts';
 import type { ToolContext, ToolResponse, OracleLearnInput } from './types.ts';
 
-/** Coerce concepts to string[] — handles string, array, or undefined from MCP input */
 export function coerceConcepts(concepts: unknown): string[] {
   if (Array.isArray(concepts)) return concepts.map(String);
-  if (typeof concepts === 'string') return concepts.split(',').map(s => s.trim()).filter(Boolean);
+  if (typeof concepts === 'string') {
+    return concepts.split(',').map((value) => value.trim()).filter(Boolean);
+  }
   return [];
 }
 
@@ -30,267 +24,85 @@ export const learnToolDef = {
     type: 'object',
     properties: {
       pattern: {
-        type: 'string',
-        minLength: 1,
-        description: 'The pattern or learning to add (can be multi-line). Must be non-empty and not whitespace-only.'
+        type: 'string', minLength: 1,
+        description: 'The pattern or learning to add (can be multi-line). Must be non-empty and not whitespace-only.',
       },
-      source: {
-        type: 'string',
-        description: 'Optional source attribution (defaults to "Oracle Learn")'
-      },
+      source: { type: 'string', description: 'Optional source attribution (defaults to "Oracle Learn")' },
       concepts: {
-        type: 'array',
-        items: { type: 'string' },
-        description: 'Optional concept tags (e.g., ["git", "safety", "trust"])'
+        type: 'array', items: { type: 'string' },
+        description: 'Optional concept tags (e.g., ["git", "safety", "trust"])',
       },
       project: {
         type: 'string',
-        description: 'Source project. Accepts: "github.com/owner/repo", "owner/repo", local path with ghq/Code prefix, or GitHub URL. Auto-normalized to "github.com/owner/repo" format.'
-      }
+        description: 'Source project. Accepts github.com/owner/repo, owner/repo, a GitHub URL, or ghq path.',
+      },
+      idempotency_key: {
+        type: 'string',
+        description: 'Optional retry key. Reuse is allowed only for identical canonical content.',
+      },
     },
-    required: ['pattern']
-  }
+    required: ['pattern'],
+  },
 };
 
-// ============================================================================
-// Pure helper functions (exported for testing)
-// ============================================================================
-
-/**
- * Normalize project input to "github.com/owner/repo" format.
- * Accepts: github.com/owner/repo, owner/repo, GitHub URLs, local ghq paths.
- */
-export function normalizeProject(input?: string): string | null {
-  if (!input) return null;
-
-  // Already normalized
-  if (input.match(/^github\.com\/[^\/]+\/[^\/]+$/)) {
-    return input.toLowerCase();
-  }
-
-  // GitHub URL
-  const urlMatch = input.match(/https?:\/\/github\.com\/([^\/]+\/[^\/]+)/);
-  if (urlMatch) return `github.com/${urlMatch[1].replace(/\.git$/, '')}`.toLowerCase();
-
-  // Local path with github.com
-  const pathMatch = input.match(/github\.com\/([^\/]+\/[^\/]+)/);
-  if (pathMatch) return `github.com/${pathMatch[1]}`.toLowerCase();
-
-  // Short format: owner/repo
-  const shortMatch = input.match(/^([^\/\s]+\/[^\/\s]+)$/);
-  if (shortMatch) return `github.com/${shortMatch[1]}`.toLowerCase();
-
-  return null;
-}
-
-/**
- * Extract project from source field (fallback).
- * Handles "arra_learn from github.com/owner/repo" and "rrr: org/repo" formats.
- */
-export function extractProjectFromSource(source?: string): string | null {
-  if (!source) return null;
-
-  const oracleLearnMatch = source.match(/from\s+(github\.com\/[^\/\s]+\/[^\/\s]+)/);
-  if (oracleLearnMatch) return oracleLearnMatch[1].toLowerCase();
-
-  const rrrMatch = source.match(/^rrr:\s*([^\/\s]+\/[^\/\s]+)/);
-  if (rrrMatch) return `github.com/${rrrMatch[1]}`.toLowerCase();
-
-  const directMatch = source.match(/(github\.com\/[^\/\s]+\/[^\/\s]+)/);
-  if (directMatch) return directMatch[1].toLowerCase();
-
-  return null;
-}
-
-// ============================================================================
-// Handler
-// ============================================================================
+export { extractProjectFromSource, normalizeProject };
 
 export async function handleLearn(ctx: ToolContext, input: OracleLearnInput): Promise<ToolResponse> {
-  // The MCP dispatch path casts arguments without validating them against
-  // inputSchema, so a caller sending the wrong keys reaches here with pattern
-  // undefined and dies on `pattern.substring` — an opaque TypeError that reads
-  // like a broken tool. Fail with the contract instead.
-  //
-  // Scope, precisely: the HTTP /api/learn route guards only a FALSY pattern
-  // (routes/knowledge/learn.ts) and its body schema is `t.Any()`, so it still
-  // lets a truthy non-string through to the same class of TypeError in
-  // server/handlers.ts. This guard covers the MCP path only; the wrong-type
-  // hole on the HTTP path and the identical blind `args as T` cast for every
-  // other tool in dispatch.ts are pre-existing and NOT fixed here — the real
-  // fix is central inputSchema validation before dispatch.
-  //
-  // Rejecting empty / whitespace-only pattern is a deliberate tightening
-  // (previously it wrote a junk learning named `pattern-<timestamp>` with no
-  // content); inputSchema now declares `minLength: 1` so discovery and runtime
-  // agree. Covered by __tests__/learn-guard.test.ts.
   if (typeof input?.pattern !== 'string' || input.pattern.trim() === '') {
     return {
       content: [{
         type: 'text',
-        text: `Error: arra_learn requires a non-empty string "pattern". Received keys: [${Object.keys(input ?? {}).join(', ')}]. `
-          + 'The learning text goes in "pattern"; tags go in "concepts". There is no "title"/"content"/"tags" parameter.',
+        text: `Error: arra_learn requires a non-empty string "pattern". Received keys: [${Object.keys(input ?? {}).join(', ')}]. The learning text goes in "pattern"; tags go in "concepts".`,
       }],
       isError: true,
     };
   }
-
-  const { pattern, source, concepts, project: projectInput } = input;
-  const now = new Date();
-  const dateStr = now.toISOString().split('T')[0];
-
-  let slug = pattern
-    .substring(0, 50)
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-
-  // Bug 1 fix: empty slug (e.g. Thai/Unicode-only pattern strips to '') causes
-  // filename collisions across distinct patterns. Fall back to a millisecond
-  // timestamp to guarantee uniqueness while preserving the date prefix.
-  if (!slug) {
-    slug = `pattern-${now.getTime()}`;
+  const models = getEmbeddingModels();
+  let runtime;
+  try {
+    runtime = resolveAsyncIndexerConfig(models);
+  } catch (error) {
+    return errorResponse(error);
   }
-
-  const filename = `${dateStr}_${slug}.md`;
-
-  // Resolve vault root for central writes
-  const vault = getVaultPsiRoot();
-  if ('needsInit' in vault) console.error(`[Vault] ${vault.hint}`);
-  const vaultRoot = 'path' in vault ? vault.path : null;
-  // Fail loud, not silent. A console.error into a tmux pane nobody reads is a
-  // silent failure: between 2026-06 and 2026-07 this branch misfiled 49
-  // learnings into the vault's own project scope with zero visible signal.
-  // If a vault IS configured but did not resolve, that is a broken environment,
-  // not a "no vault configured" state — surface it in the tool response so the
-  // caller sees it on the very first write.
-  const vaultWarning = ('needsInit' in vault && getSetting('vault_repo'))
-    ? `vault configured but unresolved — this learning is being written OUTSIDE its project scope. ${vault.hint}`
-    : null;
-
-  const project = normalizeProject(projectInput)
-    || extractProjectFromSource(source)
-    || detectProject(ctx.repoRoot);
-  const projectDir = (project || '_universal').toLowerCase();
-
-  let filePath: string;
-  let sourceFileRel: string;
-  if (vaultRoot) {
-    const dir = path.join(vaultRoot, projectDir, 'ψ', 'memory', 'learnings');
-    fs.mkdirSync(dir, { recursive: true });
-    filePath = path.join(dir, filename);
-    sourceFileRel = `${projectDir}/ψ/memory/learnings/${filename}`;
-  } else {
-    // Write to canonical REPO_ROOT, not ctx.repoRoot (the MCP server's cwd):
-    // the dashboard's /api/file resolves source_file against REPO_ROOT, so
-    // writing relative to cwd produces "local file not found" (#557).
-    const dir = path.join(REPO_ROOT, 'ψ/memory/learnings');
-    fs.mkdirSync(dir, { recursive: true });
-    filePath = path.join(dir, filename);
-    sourceFileRel = `ψ/memory/learnings/${filename}`;
+  let project: string | null;
+  try {
+    project = resolveLearnProject({ project: input.project, source: input.source, cwd: ctx.repoRoot });
+  } catch (error) {
+    return errorResponse(error);
   }
-
-  if (fs.existsSync(filePath)) {
-    throw new Error(`File already exists: ${filename}`);
-  }
-
-  const title = pattern.split('\n')[0].substring(0, 80);
-  const conceptsList = coerceConcepts(concepts);
-  const frontmatter = [
-    '---',
-    `title: ${title}`,
-    conceptsList.length > 0 ? `tags: [${conceptsList.join(', ')}]` : 'tags: []',
-    `created: ${dateStr}`,
-    `source: ${source || 'Oracle Learn'}`,
-    ...(project ? [`project: ${project}`] : []),
-    '---',
-    '',
-    `# ${title}`,
-    '',
-    pattern,
-    '',
-    '---',
-    '*Added via Oracle Learn*',
-    ''
-  ].join('\n');
-
-  fs.writeFileSync(filePath, frontmatter, 'utf-8');
-
-  const id = `learning_${dateStr}_${slug}`;
-
-  ctx.db.insert(oracleDocuments).values({
-    id,
-    type: 'learning',
-    sourceFile: sourceFileRel,
-    concepts: JSON.stringify(conceptsList),
-    createdAt: now.getTime(),
-    updatedAt: now.getTime(),
-    indexedAt: now.getTime(),
-    origin: null,
-    project,
-    createdBy: 'arra_learn',
-  }).run();
-
-  // FTS5 has no unique constraint on id — delete-then-insert to be idempotent.
-  ctx.sqlite.prepare(`DELETE FROM oracle_fts WHERE id = ?`).run(id);
-  ctx.sqlite.prepare(`
-    INSERT INTO oracle_fts (id, content, concepts)
-    VALUES (?, ?, ?)
-  `).run(id, frontmatter, conceptsList.join(' '));
-
-  // Vector indexing — two paths:
-  //   - Default (env unset): inline embed via Ollama. Keeps DB + lancedb in
-  //     step so arra_search hybrid mode works immediately. Graceful fallback
-  //     on embedder failure — FTS row above is still searchable.
-  //   - ORACLE_INDEXER_ENQUEUE=1 (M5 of indexer-CLI): queue a row in
-  //     indexing_jobs for the daemon to embed asynchronously. FTS-first /
-  //     vector-later. Never blocks ingest. Architecture:
-  //     ψ/lab/indexer-cli/DESIGN.md.
-  let embeddingStatus: 'ok' | 'skipped' | 'failed' | 'enqueued' = 'skipped';
-  if (process.env.ORACLE_INDEXER_ENQUEUE === '1') {
-    try {
-      enqueueIndexJob(ctx.sqlite, { docId: id, models: getEmbeddingModels() });
-      embeddingStatus = 'enqueued';
-    } catch (err) {
-      // Never block ingest on the queue — same posture as the inline path.
-      embeddingStatus = 'failed';
-      console.warn(`[arra_learn] enqueue failed: ${err instanceof Error ? err.message : String(err)}`);
+  if (!runtime.producerEnabled) {
+    if (process.env.ORACLE_LEARN_LEGACY_MODE !== '1') {
+      return errorResponse(new Error(
+        'arra_learn persistence is disabled; enable the async producer or explicitly set ORACLE_LEARN_LEGACY_MODE=1',
+      ));
     }
-  } else {
-    try {
-      const model = process.env.ORACLE_EMBEDDING_MODEL || 'bge-m3';
-      const vectorStore = getVectorStoreByModel(model);
-      await vectorStore.addDocuments([{
-        id,
-        document: frontmatter,
-        metadata: {
-          type: 'learning',
-          source_file: sourceFileRel,
-          project: project || '',
-          concepts: conceptsList.join(','),
-        },
-      }]);
-      embeddingStatus = 'ok';
-    } catch (err) {
-      embeddingStatus = 'failed';
-      console.warn(`[arra_learn] vector embedding failed for ${id}: ${err instanceof Error ? err.message : String(err)}`);
-      console.warn(`[arra_learn] document still searchable via FTS5; run 'bun src/scripts/index-model.ts <model>' later to backfill vectors`);
-    }
+    return handleLegacyLearn(ctx, input, project, resolveLearnStorage(project));
   }
 
+  const storage = resolveLearnStorage(project);
+  try {
+    const result = await persistAsyncLearning({
+      sqlite: ctx.sqlite, learningDir: storage.learningDir,
+      sourceFilePrefix: storage.sourceFilePrefix, models,
+    }, {
+      pattern: input.pattern, concepts: input.concepts, source: input.source,
+      project, origin: null, idempotencyKey: input.idempotency_key,
+    });
+    return mcpLearnResponse(result, storage.warning ? { warning: storage.warning } : {});
+  } catch (error) {
+    return errorResponse(error, error instanceof LearnConflictError ? 'conflict' : 'error');
+  }
+}
+
+function errorResponse(error: unknown, outcome = 'error'): ToolResponse {
   return {
     content: [{
       type: 'text',
       text: JSON.stringify({
-        success: true,
-        file: sourceFileRel,
-        id,
-        embedding: embeddingStatus,
-        ...(vaultWarning ? { warning: vaultWarning } : {}),
-        message: `Pattern added to Oracle knowledge base${vaultRoot ? ' (vault)' : ''}${vaultWarning ? ' — ⚠️ WRONG SCOPE, see warning' : ''}${embeddingStatus === 'failed' ? ' — vector embedding failed, see server log' : ''}`
-      }, null, 2)
-    }]
+        success: false, outcome,
+        error: error instanceof Error ? error.message : String(error),
+      }, null, 2),
+    }],
+    isError: true,
   };
 }

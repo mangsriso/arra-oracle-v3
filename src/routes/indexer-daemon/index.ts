@@ -1,34 +1,20 @@
-/**
- * Indexer daemon HTTP API — Elysia plugin (M3 of the indexer-CLI design).
- *
- * Ported from alpha's Hono `src/indexer/api.ts`. Same routes, same response
- * shapes, same status codes. The daemon entrypoint (`src/indexer/daemon.ts`)
- * wires the real db / models / event bus / shutdown primitives via the
- * `daemonApiPlugin(deps)` factory; tests wire mocks.
- *
- * Endpoints:
- *   POST /index            enqueue a job (per-model or all-models)
- *   GET  /jobs?status=&model=&limit=    list recent jobs
- *   GET  /events           SSE stream of worker events
- *   POST /drain            request graceful shutdown
- *   GET  /health           workers + queue depth + shutdown state
- *
- * Same trust model as Ollama — bind to 127.0.0.1 only at the daemon layer.
- *
- * Design: ψ/lab/indexer-cli/DESIGN.md (M3).
- */
-
 import { Elysia, t } from 'elysia';
 import type Database from 'bun:sqlite';
-import { enqueueIndexJob, jobsByStatus } from '../../indexer/jobs.ts';
+import { enqueueIndexJob, jobsByStatus, type QueueModel } from '../../indexer/jobs.ts';
 import type { WorkerEvent } from '../../indexer/worker.ts';
 
 export interface DaemonApiDeps {
   db: Database;
-  models: Record<string, { collection: string }>;
+  models: Record<string, QueueModel>;
+  producerEnabled: boolean;
+  workersEnabled: boolean;
+  activeModelKey: string | null;
+  indexRevision: string | null;
+  collection?: string | null;
+  dimension?: number | null;
+  livenessError?: () => string | null;
   isShuttingDown: () => boolean;
   requestShutdown: () => void;
-  /** Subscribe to live worker events. Returns an unsubscribe function. */
   subscribe: (cb: (ev: WorkerEvent) => void) => () => void;
 }
 
@@ -43,29 +29,35 @@ interface IndexingJobRow {
   claimed_at: number | null;
   finished_at: number | null;
   error: string | null;
+  next_attempt_at: number;
+  lease_until: number | null;
 }
 
-/**
- * Build the Elysia plugin for the daemon API. Returns a plugin (Elysia
- * instance), not a function to call later — pass `deps` once at boot, then
- * `.use(daemonApiPlugin(deps))`.
- */
 export function daemonApiPlugin(deps: DaemonApiDeps) {
   return new Elysia({ name: 'indexer-daemon' })
     .get('/health', () => {
       const counts = jobsByStatus(deps.db);
       const queueDepth: Record<string, number> = {};
       for (const row of counts) {
-        if (row.status === 'pending' || row.status === 'claimed') {
+        if (row.status === 'pending' || row.status === 'claimed' || row.status === 'retry_wait') {
           queueDepth[row.model_key] = (queueDepth[row.model_key] || 0) + row.count;
         }
       }
       return {
-        status: 'ok',
+        status: deps.livenessError?.() ? 'degraded' : 'ok',
         service: 'arra-indexer',
         shutting_down: deps.isShuttingDown(),
         queue_depth: queueDepth,
         models: Object.keys(deps.models),
+        liveness_error: deps.livenessError?.() ?? null,
+        mode: {
+          producer_enabled: deps.producerEnabled,
+          workers_enabled: deps.workersEnabled,
+          active_model_key: deps.activeModelKey,
+          index_revision: deps.indexRevision,
+          collection: deps.collection ?? null,
+          dimension: deps.dimension ?? null,
+        },
       };
     })
     .post(
@@ -75,21 +67,58 @@ export function daemonApiPlugin(deps: DaemonApiDeps) {
           set.status = 503;
           return { error: 'shutting down' };
         }
+        if (!deps.producerEnabled) {
+          set.status = 503;
+          return { error: 'index enqueue producer is disabled', producer_enabled: false };
+        }
         if (!body.doc_id || typeof body.doc_id !== 'string') {
           set.status = 400;
           return { error: 'doc_id required' };
         }
-        const jobs = enqueueIndexJob(deps.db, {
-          docId: body.doc_id,
-          modelKey: body.model_key,
-          models: deps.models,
-        });
-        return { jobs };
+        if (!body.content_hash || typeof body.content_hash !== 'string') {
+          set.status = 400;
+          return { error: 'content_hash required' };
+        }
+        if (!/^[0-9a-f]{64}$/.test(body.content_hash)) {
+          set.status = 400;
+          return { error: 'content_hash must be 64 lowercase hexadecimal characters' };
+        }
+        const fts = deps.db.query<{ content: string }, [string]>(
+          'SELECT content FROM oracle_fts WHERE id = ?',
+        ).get(body.doc_id);
+        if (!fts) {
+          set.status = 400;
+          return { error: 'doc_id has no authoritative FTS projection' };
+        }
+        const actualHash = new Bun.CryptoHasher('sha256').update(fts.content).digest('hex');
+        if (actualHash !== body.content_hash) {
+          set.status = 409;
+          return { error: 'content_hash does not match the authoritative FTS projection' };
+        }
+        if ((!body.model_key && !body.all_models) || (body.model_key && body.all_models)) {
+          set.status = 400;
+          return { error: 'specify exactly one model_key, or all_models: true' };
+        }
+        try {
+          const jobs = enqueueIndexJob(deps.db, {
+            docId: body.doc_id,
+            contentHash: body.content_hash,
+            modelKey: body.model_key,
+            allModels: body.all_models,
+            models: deps.models,
+          });
+          return { jobs };
+        } catch (error) {
+          set.status = 400;
+          return { error: error instanceof Error ? error.message : String(error) };
+        }
       },
       {
         body: t.Object({
           doc_id: t.Optional(t.String()),
           model_key: t.Optional(t.String()),
+          content_hash: t.Optional(t.String()),
+          all_models: t.Optional(t.Boolean()),
         }),
       },
     )
@@ -98,7 +127,8 @@ export function daemonApiPlugin(deps: DaemonApiDeps) {
       ({ query }) => {
         const status = query.status;
         const modelKey = query.model;
-        const limit = Math.min(parseInt(query.limit || '100', 10) || 100, 1000);
+        const parsedLimit = Number.parseInt(query.limit || '100', 10);
+        const limit = Math.min(Math.max(Number.isFinite(parsedLimit) ? parsedLimit : 100, 1), 1000);
 
         const where: string[] = [];
         const params: Array<string | number> = [];
@@ -111,8 +141,9 @@ export function daemonApiPlugin(deps: DaemonApiDeps) {
           params.push(modelKey);
         }
         const sql = `SELECT id, doc_id, model_key, collection, status, attempts,
-                            created_at, claimed_at, finished_at, error
-                     FROM indexing_jobs
+                            created_at, claimed_at, finished_at, error,
+                            next_attempt_at, lease_until
+                     FROM indexing_jobs_v2
                      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                      ORDER BY created_at DESC
                      LIMIT ?`;

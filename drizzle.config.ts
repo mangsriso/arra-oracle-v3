@@ -30,5 +30,10 @@ export default defineConfig({
     'settings',       // Auth & app settings
     'schedule',       // Appointments & events
     'menu_items',     // Studio navigation (seeded from route detail.menu)
+    'indexing_jobs',
+    'learn_reservations_v2',
+    'indexing_jobs_v2',
+    'indexing_job_attempts_v2',
+    'indexing_job_events_v2',
   ],
 });

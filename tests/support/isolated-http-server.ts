@@ -39,7 +39,7 @@ function allocateLoopbackPort(): number {
   });
   const port = reservation.port;
   reservation.stop(true);
-  if (port === 47778) return allocateLoopbackPort();
+  if ([47778, 47779, 11434].includes(port)) return allocateLoopbackPort();
   return port;
 }
 
@@ -83,6 +83,7 @@ export function createIsolatedRuntime(
       ORACLE_VECTOR_DB: 'lancedb',
       ORACLE_VECTOR_DB_PATH: path.join(dataDir, 'lancedb'),
       ORACLE_DISABLE_LOCAL_VECTOR: 'true',
+      ORACLE_LEARN_LEGACY_MODE: '1',
       ORACLE_EMBEDDING_PROVIDER: 'ollama',
       ORACLE_EMBEDDING_MODEL: 'bge-m3',
       VECTOR_URL: '',

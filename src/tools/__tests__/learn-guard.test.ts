@@ -82,6 +82,6 @@ describe('learnToolDef schema matches the guard', () => {
 
   it('does not advertise title/content/tags', () => {
     const keys = Object.keys(learnToolDef.inputSchema.properties);
-    expect(keys).toEqual(['pattern', 'source', 'concepts', 'project']);
+    expect(keys).toEqual(['pattern', 'source', 'concepts', 'project', 'idempotency_key']);
   });
 });

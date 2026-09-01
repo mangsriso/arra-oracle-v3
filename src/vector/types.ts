@@ -73,7 +73,10 @@ export type EmbedType = 'query' | 'passage';
 export interface EmbeddingProvider {
   readonly name: string;
   readonly dimensions: number;
-  embed(texts: string[], type?: EmbedType): Promise<number[][]>;
+  /** False when dimensions is only a legacy compatibility guess. */
+  readonly dimensionKnown?: boolean;
+  readonly supportsAbort?: boolean;
+  embed(texts: string[], type?: EmbedType, signal?: AbortSignal): Promise<number[][]>;
 }
 
 export type VectorDBType = 'chroma' | 'sqlite-vec' | 'lancedb' | 'qdrant' | 'cloudflare-vectorize';

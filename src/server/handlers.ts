@@ -17,6 +17,7 @@ import { detectProject } from './project-detect.ts';
 import { annotateAndFilterSuperseded, dedupChunks, normalizeBm25Rank, normalizeVectorDistance, sanitizeFtsQuery } from './search-quality.ts';
 import { coerceConcepts } from '../tools/learn.ts';
 import { createVectorProxy } from './vector-proxy.ts';
+import { persistServerAsyncLearning } from './learn-persistence.ts';
 
 // Module-level proxy instance — bound to VECTOR_URL at boot. If VECTOR_URL is
 // unset, this is null and the local vector adapter runs in-process (legacy
@@ -726,14 +727,6 @@ export function handleGraph(limitPerType = 310) {
 
   return { nodes, links };
 }
-
-
-/**
- * Add new pattern/learning to knowledge base
- * @param origin - 'mother' | 'arthur' | 'volt' | 'human' (null = universal)
- * @param project - ghq-style project path (null = universal)
- * @param cwd - Auto-detect project from cwd if project not specified
- */
 /**
  * Persist a learning-type document: write .md file, insert row in oracle_documents + FTS.
  * Shared by handleLearn and handleSessionSummary so both take the same path post-#867.
@@ -812,15 +805,21 @@ export function persistLearningDoc(opts: {
   return { file: sourceFile, id };
 }
 
-export function handleLearn(
+export async function handleLearn(
   pattern: string,
   source?: string,
   concepts?: string[],
   origin?: string,
   project?: string,
-  cwd?: string
-) {
-  const resolvedProject = (project ?? detectProject(cwd))?.toLowerCase() ?? null;
+  cwd?: string,
+  idempotencyKey?: string,
+  ) {
+    const { resolveLearnProject } = await import('../learn/project.ts');
+    const resolvedProject = resolveLearnProject({ project, source, cwd });
+  const asyncResult = await persistServerAsyncLearning(sqlite, {
+    pattern, source, concepts, origin, project: resolvedProject, idempotencyKey,
+  });
+  if (asyncResult) return asyncResult;
   const dateStr = new Date().toISOString().split('T')[0];
 
   const slug = pattern
