@@ -14,6 +14,7 @@ import { Database } from 'bun:sqlite';
 import path from 'path';
 import fs from 'fs';
 import * as schema from './schema.ts';
+import { repairPartialA2Schema } from './a2-compat.ts';
 import { DB_PATH, ORACLE_DATA_DIR } from '../config.ts';
 
 // Migrations folder (relative to this file)
@@ -75,6 +76,11 @@ function initializeDatabase(sqliteDb: Database, drizzleDb: BunSQLiteDatabase<typ
   sqliteDb.exec('PRAGMA journal_mode = WAL');
   sqliteDb.exec('PRAGMA foreign_keys = ON');
   sqliteDb.exec('PRAGMA busy_timeout = 5000');
+
+  // Some hosts recorded an early 0017 draft under the final migration
+  // timestamp. Repair only its missing additive pieces before Drizzle decides
+  // which migrations remain due.
+  repairPartialA2Schema(sqliteDb);
 
   // Run Drizzle migrations (creates/updates all schema tables)
   migrate(drizzleDb, { migrationsFolder: MIGRATIONS_FOLDER });

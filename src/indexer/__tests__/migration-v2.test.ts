@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import Database from 'bun:sqlite';
+import { repairPartialA2Schema } from '../../db/a2-compat.ts';
 
 async function applyMigration(db: Database) {
   const sql = await Bun.file(
@@ -9,6 +10,37 @@ async function applyMigration(db: Database) {
 }
 
 describe('0017 durable async indexing migration', () => {
+  it('repairs an early partial 0017 without rewriting existing jobs', () => {
+    const db = new Database(':memory:');
+    db.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE indexing_jobs_v2 (
+        id TEXT PRIMARY KEY NOT NULL,
+        doc_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        cancellation_requested_at INTEGER
+      );
+      INSERT INTO indexing_jobs_v2
+        (id, doc_id, status, cancellation_requested_at)
+      VALUES ('preserved', 'doc', 'pending', 42);
+    `);
+
+    repairPartialA2Schema(db);
+    repairPartialA2Schema(db);
+
+    const columns = db.query<{ name: string }, []>('PRAGMA table_info(indexing_jobs_v2)')
+      .all().map((row) => row.name);
+    expect(columns).toContain('external_write_started_at');
+    expect(columns).toContain('cancellation_too_late_at');
+    expect(db.query('SELECT id, doc_id, status, cancellation_requested_at FROM indexing_jobs_v2').get())
+      .toEqual({ id: 'preserved', doc_id: 'doc', status: 'pending', cancellation_requested_at: 42 });
+    expect(db.query(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'indexing_job_events_v2'",
+    ).get()).toEqual({ name: 'indexing_job_events_v2' });
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    db.close();
+  });
+
   it('keeps the event table in Drizzle schema/filter parity', async () => {
     const config = await Bun.file(`${import.meta.dir}/../../../drizzle.config.ts`).text();
     const schema = await Bun.file(`${import.meta.dir}/../../db/schema-a2.ts`).text();
