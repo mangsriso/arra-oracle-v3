@@ -159,6 +159,28 @@ test('HTTP idempotency conflict is structured and preserves the first identity',
   }
 }, 45_000);
 
+test('configured vault self-symlink keeps logical ψ provenance without blocking publication', async () => {
+  const runtime = a2Runtime('arra-a2-vault-self-symlink');
+  let service: Awaited<ReturnType<typeof startService>> | undefined;
+  try {
+    const vault = await configureVault(runtime);
+    const projectRoot = path.join(vault, 'github.com/example/self-link');
+    fs.mkdirSync(projectRoot, { recursive: true });
+    fs.symlinkSync('.', path.join(projectRoot, 'ψ'));
+    service = await startService(runtime, 'src/server.ts', `${runtime.baseUrl}/api/health`);
+    const response = await httpLearn(runtime, {
+      pattern: 'self symlink vault publication', project: 'example/self-link',
+    });
+    expect(response.status).toBe(201);
+    expect(response.body.file).toStartWith('github.com/example/self-link/ψ/memory/learnings/');
+    const filename = response.body.file.split('/').at(-1);
+    expect(fs.existsSync(path.join(projectRoot, 'memory/learnings', filename))).toBe(true);
+  } finally {
+    if (service) await service.stop().catch(() => {});
+    cleanupRuntime(runtime);
+  }
+}, 45_000);
+
 test('legacy MCP uses configured project-scoped vault placement', async () => {
   const runtime = a2Runtime('arra-a2-legacy-vault');
   try {
