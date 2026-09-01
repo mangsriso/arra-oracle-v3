@@ -34,6 +34,17 @@ export class OllamaEmbeddings implements EmbeddingProvider {
   private model: string;
   private _dimensionsDetected = false;
 
+  private normalizeForDotDistance(vector: number[]): number[] {
+    if (!/(^|\/)bge-m3(?::|$)/.test(this.model)) return vector;
+    let squaredNorm = 0;
+    for (const value of vector) squaredNorm += value * value;
+    const norm = Math.sqrt(squaredNorm);
+    if (!Number.isFinite(norm) || norm <= 0) {
+      throw new Error('Ollama bge-m3 returned a vector with invalid L2 norm');
+    }
+    return vector.map((value) => value / norm);
+  }
+
   constructor(config: { baseUrl?: string; model?: string } = {}) {
     this.baseUrl = config.baseUrl || process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
     this.model = config.model || 'nomic-embed-text';
@@ -69,11 +80,12 @@ export class OllamaEmbeddings implements EmbeddingProvider {
       }
 
       const data = await response.json() as { embedding: number[] };
-      embeddings.push(data.embedding);
+      const embedding = this.normalizeForDotDistance(data.embedding);
+      embeddings.push(embedding);
 
       // Auto-detect dimensions from first response
-      if (!this._dimensionsDetected && data.embedding.length > 0) {
-        this.dimensions = data.embedding.length;
+      if (!this._dimensionsDetected && embedding.length > 0) {
+        this.dimensions = embedding.length;
         this._dimensionsDetected = true;
       }
     }
