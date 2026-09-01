@@ -168,6 +168,12 @@ const app = new Elysia()
       return { error: 'Not found' };
     }
     const msg = (error as any)?.message ?? String(error);
+    // Elysia may surface a child route's schema failure at the parent app
+    // (notably under Bun 1.4), before the child's onError hook can respond.
+    if (code === 'VALIDATION') {
+      set.status = 400;
+      return { error: msg };
+    }
     const isDbLock = msg.includes('disk I/O') || msg.includes('database is locked') || msg.includes('SQLITE_BUSY');
     if (isDbLock) {
       set.status = 503;
