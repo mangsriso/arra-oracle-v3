@@ -97,6 +97,10 @@ export class LanceDBAdapter implements VectorStoreAdapter {
     if (needEmbed.length > 0) {
       const texts = needEmbed.map(i => docs[i].document);
       fresh = await this.embedder.embed(texts, 'passage');
+      if (!Array.isArray(fresh) || fresh.length !== needEmbed.length
+        || needEmbed.some((_, k) => !Array.isArray(fresh[k]))) {
+        throw new Error(`Embedding count mismatch: ${Array.isArray(fresh) ? fresh.length : 'no'} vectors for ${needEmbed.length} documents`);
+      }
     }
     let freshIdx = 0;
 
