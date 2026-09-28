@@ -6,7 +6,7 @@
  */
 
 import type { EmbeddingProvider, EmbeddingProviderType } from './types.ts';
-import { EmbeddingProviderHttpError } from './provider-error.ts';
+import { EmbeddingProviderHttpError, assertEmbeddingResponseShape } from './provider-error.ts';
 
 /**
  * Placeholder for ChromaDB's internal embeddings.
@@ -104,11 +104,14 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
   private apiKey: string;
   private model: string;
   private baseUrl: string;
+  private cacheBypass: boolean;
 
-  constructor(config: { apiKey?: string; model?: string; baseUrl?: string } = {}) {
+  constructor(config: { apiKey?: string; model?: string; baseUrl?: string; cacheBypass?: boolean } = {}) {
     this.apiKey = config.apiKey || process.env.ORACLE_OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
     this.baseUrl = config.baseUrl || process.env.ORACLE_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
     this.model = config.model || 'text-embedding-3-small';
+    // LiteLLM: skip its response cache for multi-input calls (cache-served batches came back malformed)
+    this.cacheBypass = config.cacheBypass ?? (process.env.ORACLE_OPENAI_CACHE_BYPASS === '1');
 
     // Known model dimensions
     const KNOWN_DIMS: Record<string, number> = {
@@ -125,13 +128,15 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
   }
 
   async embed(texts: string[], _type?: 'query' | 'passage', signal?: AbortSignal): Promise<number[][]> {
+    const bypass = this.cacheBypass && texts.length > 1;
     const response = await fetch(`${this.baseUrl}/embeddings`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
+        ...(bypass ? { 'Cache-Control': 'no-cache' } : {}),
       },
-      body: JSON.stringify({ input: texts, model: this.model }),
+      body: JSON.stringify({ input: texts, model: this.model, ...(bypass ? { cache: { 'no-cache': true, 'no-store': true } } : {}) }),
       signal,
     });
 
@@ -140,13 +145,8 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
       throw new EmbeddingProviderHttpError(response.status, `OpenAI API error: ${error}`);
     }
 
-    const data = await response.json() as {
-      data: { embedding: number[]; index: number }[];
-    };
-
-    return data.data
-      .sort((a, b) => a.index - b.index)
-      .map(d => d.embedding);
+    const data = await response.json() as { data?: unknown };
+    return assertEmbeddingResponseShape(data?.data, texts.length);
   }
 }
 

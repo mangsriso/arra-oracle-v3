@@ -117,6 +117,30 @@ describe('LanceDB addDocuments — precomputed vectors', () => {
     expect(res.ids).toContain('doc-rt');
   });
 
+  it('rejects an embedder that returns the wrong number of vectors, before writing', async () => {
+    for (const delta of [-1, 1]) {
+      const miscount = new LanceDBAdapter('precomputed_test', tmpDir, {
+        name: 'miscount', dimensions: 8, supportsAbort: true,
+        embed: async (texts: string[]) =>
+          Array.from({ length: texts.length + delta }, () => Array.from({ length: 8 }, () => 7)),
+      });
+      await miscount.connect();
+      await miscount.ensureCollection();
+      const before = await miscount.getStats();
+      const docs: VectorDocument[] = [
+        { id: 'doc-4', document: 'fourth changed', metadata: { type: 'test' } },
+        { id: 'doc-miscount', document: 'new', metadata: { type: 'test' } },
+      ];
+      await expect(miscount.upsertDocuments(docs)).rejects.toThrow('Embedding count mismatch');
+      await expect(miscount.addDocuments(docs)).rejects.toThrow('Embedding count mismatch');
+      expect((await miscount.getStats()).count).toBe(before.count);
+      const texts = await miscount.getDocumentTexts();
+      expect(texts.find(d => d.id === 'doc-4')?.text).toBe('fourth');
+      expect(texts.some(d => d.id === 'doc-miscount')).toBe(false);
+      await miscount.close();
+    }
+  });
+
   it('rejects an existing collection with a different vector dimension', async () => {
     const mismatch = new LanceDBAdapter('precomputed_test', tmpDir, {
       name: 'wrong', dimensions: 3, supportsAbort: true,
