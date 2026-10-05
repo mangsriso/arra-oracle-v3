@@ -4,6 +4,7 @@ import { MCP_SERVER_NAME } from '../../const.ts';
 import { resolveVaultPath } from '../../vault/discovery.ts';
 import { getSetting } from '../../db/index.ts';
 import { resolveVaultHealth } from './vault-health.ts';
+import { getLoopLagStatus } from '../../server/loop-lag.ts';
 import pkg from '../../../package.json' with { type: 'json' };
 import { getEmbeddingModels } from '../../vector/factory.ts';
 import { resolveAsyncIndexerConfig } from '../../vector/indexer-config.ts';
@@ -55,6 +56,7 @@ export const healthEndpoint = new Elysia().get('/health', () => {
     repoRoot: REPO_ROOT,
     vault,
     indexing,
+    loop_lag: getLoopLagStatus(),
   };
 }, {
   detail: {
