@@ -47,6 +47,8 @@ import { mcpRoutes } from './routes/mcp/index.ts';
 import { createAuthorizationGuard } from './routes/auth/authorization.ts';
 import { gatewayPlugin } from './gateway/index.ts';
 
+import { startLoopLag } from './server/loop-lag.ts';
+
 import pkg from '../package.json' with { type: 'json' };
 
 try {
@@ -55,6 +57,8 @@ try {
 } catch (e) {
   // table might not exist yet — fine on first boot
 }
+
+startLoopLag(ORACLE_DATA_DIR);
 
 console.log('[Vector] mode:', VECTOR_URL ? 'proxy → ' + VECTOR_URL : 'local');
 
