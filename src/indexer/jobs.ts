@@ -103,6 +103,16 @@ export function claimNextJob(
   const now = opts.now ?? Date.now();
   const leaseUntil = now + (opts.leaseMs ?? DEFAULT_LEASE_MS);
   const maxAttempts = opts.maxAttempts ?? MAX_JOB_ATTEMPTS;
+  // Read-only hint, so an idle poll never asks for the write lock (a WAL reader is not
+  // blocked by a writer). The transaction below re-checks everything it relies on.
+  const due = db.query<{ ok: number }, [string, number, number, number]>(`
+    SELECT 1 AS ok FROM indexing_jobs_v2
+    WHERE model_key = ? AND (
+      (status = 'claimed' AND lease_until <= ?)
+      OR (status IN ('pending','retry_wait') AND next_attempt_at <= ? AND attempts < ?)
+    ) LIMIT 1
+  `).get(modelKey, now, now, maxAttempts);
+  if (!due) return null;
   const token = crypto.randomUUID();
   db.exec('BEGIN IMMEDIATE');
   try {
