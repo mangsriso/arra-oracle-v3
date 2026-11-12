@@ -8,6 +8,7 @@ import {
   type TerminalJobStatus,
 } from './job-transitions.ts';
 import { isPermanentProviderError } from '../vector/provider-error.ts';
+import { isSqliteBusy } from './sqlite-busy.ts';
 
 export type DocumentLoadResult =
   | { kind: 'ready'; text: string; metadata: Record<string, string | number> }
@@ -32,6 +33,7 @@ export interface WorkerDeps {
   shutdownSignal?: AbortSignal;
   pollIntervalMs?: number;
   attemptTimeoutMs?: number;
+  busyBackoffMs?: number;
   leaseMs?: number;
   heartbeatMs?: number;
   now?: () => number;
@@ -45,7 +47,8 @@ export type WorkerEvent =
   | { type: 'retry'; job: EnqueuedJob; error: string }
   | { type: 'terminal'; job: EnqueuedJob; status: TerminalJobStatus; error?: string }
   | { type: 'stale'; job: EnqueuedJob }
-  | { type: 'idle'; modelKey: string };
+  | { type: 'idle'; modelKey: string }
+  | { type: 'db_busy'; op: 'claim' | 'heartbeat' | 'finalize'; consecutive: number; error: string };
 
 export interface WorkerStats {
   modelKey: string;
@@ -53,6 +56,7 @@ export interface WorkerStats {
   errors: number;
   emptyPolls: number;
   staleClaims: number;
+  dbBusy: number;
 }
 
 export class PermanentIndexError extends Error {}
@@ -62,6 +66,8 @@ const DOCUMENT_TERMINAL: Record<Exclude<DocumentLoadResult['kind'], 'ready'>, Te
   content_mismatch: 'superseded',
   fts_mismatch: 'blocked_projection',
 };
+
+const BUSY_BACKOFF_MAX_MS = 15_000;
 
 function sleep(ms: number): Promise<void> {
   return Bun.sleep(ms);
@@ -73,7 +79,7 @@ function message(error: unknown): string {
 
 export async function runWorker(modelKey: string, deps: WorkerDeps): Promise<WorkerStats> {
   const stats: WorkerStats = {
-    modelKey, processed: 0, errors: 0, emptyPolls: 0, staleClaims: 0,
+    modelKey, processed: 0, errors: 0, emptyPolls: 0, staleClaims: 0, dbBusy: 0,
   };
   const now = deps.now ?? Date.now;
   const leaseMs = deps.leaseMs ?? DEFAULT_LEASE_MS;
@@ -84,10 +90,31 @@ export async function runWorker(modelKey: string, deps: WorkerDeps): Promise<Wor
   }
   if (timeoutMs >= leaseMs) throw new Error('Attempt timeout must be shorter than lease');
 
+  let claimBusyStreak = 0;
+  const dbBusy = (op: 'claim' | 'heartbeat' | 'finalize', error: unknown, consecutive = 1) => {
+    stats.dbBusy++;
+    deps.onEvent?.({ type: 'db_busy', op, consecutive, error: message(error) });
+  };
+
   while (!deps.isShuttingDown()) {
-    const job = claimNextJob(deps.db, modelKey, {
-      workerId: deps.workerId, now: now(), leaseMs,
-    });
+    let job: EnqueuedJob | null;
+    try {
+      job = claimNextJob(deps.db, modelKey, {
+        workerId: deps.workerId, now: now(), leaseMs,
+      });
+      claimBusyStreak = 0;
+    } catch (error) {
+      // No claim is held here (BEGIN IMMEDIATE failed or was rolled back), so waiting
+      // and polling again is always safe. Anything that is not lock contention stays fatal.
+      if (!isSqliteBusy(error)) throw error;
+      claimBusyStreak++;
+      dbBusy('claim', error, claimBusyStreak);
+      await sleep(Math.min(
+        BUSY_BACKOFF_MAX_MS,
+        (deps.busyBackoffMs ?? 1_000) * 2 ** Math.min(claimBusyStreak - 1, 4),
+      ));
+      continue;
+    }
     if (!job) {
       stats.emptyPolls++;
       deps.onEvent?.({ type: 'idle', modelKey });
@@ -118,6 +145,12 @@ export async function runWorker(modelKey: string, deps: WorkerDeps): Promise<Wor
           controller.abort(new Error('Job cancellation requested'));
         }
       } catch (error) {
+        // A missed renewal is not a lost fence: the lease outlives several heartbeats and
+        // every transition re-checks lease_until, so a lapsed lease is seen as a stale claim.
+        if (isSqliteBusy(error)) {
+          dbBusy('heartbeat', error);
+          return;
+        }
         lostFence = true;
         controller.abort(error);
         deps.onUnsafeTimeout?.(job, 'heartbeat-database');
@@ -188,27 +221,36 @@ export async function runWorker(modelKey: string, deps: WorkerDeps): Promise<Wor
       });
     } catch (error) {
       const detail = message(error);
-      if (cancellationRequested(deps.db, job.id, token)) {
-        if (finishClaim(deps.db, job.id, token, 'cancelled', detail, now())) {
-          stats.errors++;
-          deps.onEvent?.({ type: 'terminal', job, status: 'cancelled', error: detail });
-        } else stale(stats, deps, job);
-      } else if (error instanceof PermanentIndexError || isPermanentProviderError(error)) {
-        if (finishClaim(deps.db, job.id, token, 'failed_permanent', detail, now())) {
-          stats.errors++;
-          deps.onEvent?.({ type: 'terminal', job, status: 'failed_permanent', error: detail });
+      try {
+        if (cancellationRequested(deps.db, job.id, token)) {
+          if (finishClaim(deps.db, job.id, token, 'cancelled', detail, now())) {
+            stats.errors++;
+            deps.onEvent?.({ type: 'terminal', job, status: 'cancelled', error: detail });
+          } else stale(stats, deps, job);
+        } else if (error instanceof PermanentIndexError || isPermanentProviderError(error)) {
+          if (finishClaim(deps.db, job.id, token, 'failed_permanent', detail, now())) {
+            stats.errors++;
+            deps.onEvent?.({ type: 'terminal', job, status: 'failed_permanent', error: detail });
+          } else {
+            stale(stats, deps, job);
+          }
         } else {
-          stale(stats, deps, job);
+          const status = retryClaim(deps.db, job.id, token, detail, now());
+          if (status === 'stale') {
+            stale(stats, deps, job);
+          } else {
+            stats.errors++;
+            if (status === 'retry_wait') deps.onEvent?.({ type: 'retry', job, error: detail });
+            else deps.onEvent?.({ type: 'terminal', job, status: 'exhausted', error: detail });
+          }
         }
-      } else {
-        const status = retryClaim(deps.db, job.id, token, detail, now());
-        if (status === 'stale') {
-          stale(stats, deps, job);
-        } else {
-          stats.errors++;
-          if (status === 'retry_wait') deps.onEvent?.({ type: 'retry', job, error: detail });
-          else deps.onEvent?.({ type: 'terminal', job, status: 'exhausted', error: detail });
-        }
+      } catch (finalizeError) {
+        // The outcome could not be recorded. Leave the row claimed: claimNextJob's lease
+        // reaper closes it as lease_expired and schedules the retry, exactly as after a
+        // process death. Dying here would reach the same state with an outage on top.
+        if (!isSqliteBusy(finalizeError)) throw finalizeError;
+        stats.errors++;
+        dbBusy('finalize', finalizeError);
       }
     } finally {
       clearTimeout(timeout);

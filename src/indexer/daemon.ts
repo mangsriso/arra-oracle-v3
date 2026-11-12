@@ -10,6 +10,7 @@ import { makeDocumentLoader } from './source-loader.ts';
 import { daemonApiPlugin, makeEventBus } from '../routes/indexer-daemon/index.ts';
 import { getVaultPsiRoot } from '../vault/discovery.ts';
 import { createDatabase } from '../db/index.ts';
+import { describeLockHolders } from './lock-holders.ts';
 
 interface IndexerOwnerLock { release(): void }
 
@@ -30,6 +31,21 @@ export async function startDaemon(): Promise<void> {
   const shutdownSignal = new AbortController();
   let livenessError: string | null = null;
   let ownerLock: IndexerOwnerLock | null = null;
+  const die = (reason: string) => {
+    livenessError = reason;
+    shuttingDown = true;
+    console.error(`[arra-indexer] fatal: ${reason} — exiting 70`);
+    setTimeout(() => process.exit(70), 0);
+  };
+  eventBus.subscribe((event) => {
+    if (event.type !== 'db_busy') return;
+    if (event.op !== 'claim' || event.consecutive === 1 || event.consecutive % 20 === 0) {
+      console.warn(
+        `[arra-indexer] database busy during ${event.op} (consecutive=${event.consecutive}): ${event.error}`
+        + ` — ${describeLockHolders(DB_PATH)}`,
+      );
+    }
+  });
 
   const activeModels = (runtime.producerEnabled || runtime.workersEnabled) && runtime.modelKey
     ? {
@@ -91,16 +107,12 @@ export async function startDaemon(): Promise<void> {
       isShuttingDown: () => shuttingDown,
       shutdownSignal: shutdownSignal.signal,
       onEvent: eventBus.publish,
-      onUnsafeTimeout: (_job, phase) => {
-        livenessError = `unsafe external operation timeout: ${phase}`;
-        shuttingDown = true;
-        setTimeout(() => process.exit(70), 0);
-      },
-    }).catch((error) => {
-      livenessError = error instanceof Error ? error.message : String(error);
-      shuttingDown = true;
-      setTimeout(() => process.exit(70), 0);
-    }));
+      onUnsafeTimeout: (job, phase) => die(
+        `attempt could not be stopped safely: phase=${phase} job=${job.id} doc=${job.docId}`,
+      ),
+    }).catch((error) => die(
+      `worker stopped: ${error instanceof Error ? error.stack ?? error.message : String(error)}`,
+    )));
   }
 
   const app = new Elysia()
@@ -133,7 +145,10 @@ export async function startDaemon(): Promise<void> {
     const drained = await Promise.race([
       Promise.all(workerPromises).then(() => true), Bun.sleep(shutdownMs).then(() => false),
     ]);
-    if (!drained) process.exit(70);
+    if (!drained) {
+      console.error(`[arra-indexer] fatal: drain did not finish in ${shutdownMs} ms — exiting 70`);
+      process.exit(70);
+    }
     await Promise.all(stores.map((store) => store.close()));
     ownerLock?.release();
     db.close();
