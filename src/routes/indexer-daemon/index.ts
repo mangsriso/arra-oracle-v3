@@ -37,6 +37,15 @@ export function daemonApiPlugin(deps: DaemonApiDeps) {
   return new Elysia({ name: 'indexer-daemon' })
     .get('/health', () => {
       const counts = jobsByStatus(deps.db);
+      const model = deps.workersEnabled ? deps.activeModelKey : null;
+      const ages = model
+        ? deps.db.query<{ oldest: number | null; finished: number | null }, [string, string]>(`
+            SELECT (SELECT MIN(created_at) FROM indexing_jobs_v2
+                    WHERE model_key = ? AND status IN ('pending','retry_wait','claimed')) AS oldest,
+                   (SELECT MAX(finished_at) FROM indexing_jobs_v2 WHERE model_key = ?) AS finished
+          `).get(model, model)
+        : null;
+      const now = Date.now();
       const queueDepth: Record<string, number> = {};
       for (const row of counts) {
         if (row.status === 'pending' || row.status === 'claimed' || row.status === 'retry_wait') {
@@ -50,6 +59,9 @@ export function daemonApiPlugin(deps: DaemonApiDeps) {
         queue_depth: queueDepth,
         models: Object.keys(deps.models),
         liveness_error: deps.livenessError?.() ?? null,
+        uptime_s: Math.round(process.uptime()),
+        queue_oldest_age_ms: ages?.oldest == null ? null : now - ages.oldest,
+        last_finished_age_ms: ages?.finished == null ? null : now - ages.finished,
         mode: {
           producer_enabled: deps.producerEnabled,
           workers_enabled: deps.workersEnabled,
